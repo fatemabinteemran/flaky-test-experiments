@@ -1,0 +1,85 @@
+name: Repository Audit (Pilot)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: autogpt
+            repository: Significant-Gravitas/AutoGPT
+            sha: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+          - project: skyvern
+            repository: Skyvern-AI/skyvern
+            sha: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+
+    steps:
+      - name: Check out pinned project commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.sha }}
+          path: subject
+          persist-credentials: false
+
+      - name: Check commit and inventory test files
+        env:
+          PROJECT: ${{ matrix.project }}
+          EXPECTED_SHA: ${{ matrix.sha }}
+        run: |
+          mkdir -p audit
+          python3 - <<'PY'
+          import csv, os, pathlib, re, subprocess, sys
+
+          project = os.environ['PROJECT']
+          expected = os.environ['EXPECTED_SHA']
+          actual = subprocess.check_output(
+              ['git', '-C', 'subject', 'rev-parse', 'HEAD'], text=True
+          ).strip()
+          if actual != expected:
+              sys.exit(f'Commit mismatch! Expected {expected}, got {actual}')
+
+          paths = subprocess.check_output(
+              ['git', '-C', 'subject', 'ls-files'], text=True
+          ).splitlines()
+          rows = []
+          for p in paths:
+              filename = pathlib.PurePosixPath(p).name
+              if re.match(r'^(test_.*|.*_test)\.py$', filename):
+                  hint = 'pytest-candidate'
+              elif re.search(r'\.(test|spec)\.(ts|tsx|js|jsx)$', filename):
+                  hint = 'js-test-candidate'
+              else:
+                  continue
+              rows.append([project, actual, hint, p])
+
+          out = pathlib.Path('audit')
+          with (out / 'test_file_candidates.csv').open('w', newline='') as f:
+              w = csv.writer(f)
+              w.writerow(['project', 'sha', 'framework_hint', 'path'])
+              w.writerows(rows)
+          with (out / 'environment.txt').open('w') as f:
+              f.write(f'Project: {project}\nCommit: {actual}\n')
+              f.write(f'Test-file candidates: {len(rows)}\n')
+              for command in (['python3', '--version'], ['node', '--version'], ['nproc']):
+                  result = subprocess.run(command, text=True, capture_output=True)
+                  f.write(f'{" ".join(command)}: {result.stdout.strip() or result.stderr.strip()}\n')
+              f.write('NOTE: This is a FILE inventory, not per-test collection.\n')
+          print(f'{project}: verified {actual}; {len(rows)} test-file candidates')
+          PY
+
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-${{ matrix.project }}
+          path: audit/
+          retention-days: 14
