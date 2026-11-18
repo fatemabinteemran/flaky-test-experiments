@@ -1,0 +1,263 @@
+name: AutoGPT Python Collection Encryption Fix (Pilot)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-collection-recovery:
+    name: recover-${{ matrix.project }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: autogpt
+            repository: Significant-Gravitas/AutoGPT
+            sha: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+            workdir: source/autogpt_platform/backend
+
+    steps:
+      - name: Checkout research workflow repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout specified project commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify exact commit and save environment
+        env:
+          PROJECT: ${{ matrix.project }}
+          REPOSITORY: ${{ matrix.repository }}
+          EXPECTED_SHA: ${{ matrix.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          ACTUAL_SHA="$(git -C source rev-parse HEAD)"
+          {
+            echo "project=$PROJECT"
+            echo "repository=$REPOSITORY"
+            echo "expected_sha=$EXPECTED_SHA"
+            echo "actual_sha=$ACTUAL_SHA"
+            echo "utc=$(date -u +%FT%TZ)"
+            echo "runner_image=${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            uname -a
+            python --version
+            python -m pip --version
+            echo "cpu_count=$(nproc)"
+            free -h
+            df -h .
+          } > artifacts/environment.txt
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+
+      - name: Create pytest inventory exporter
+        shell: bash
+        run: |
+          cat > research_pytest_export.py <<'PY'
+          import collections
+          import csv
+          import json
+          import os
+          from pathlib import Path
+
+          def pytest_collectreport(report):
+              if report.failed:
+                  path = Path(os.environ['RESEARCH_ERRORS_PATH'])
+                  with path.open('a', encoding='utf-8') as file:
+                      file.write(json.dumps({
+                          'nodeid': report.nodeid,
+                          'error': str(report.longrepr),
+                      }, ensure_ascii=False) + '\n')
+
+          def pytest_collection_finish(session):
+              items = session.items
+              counts = collections.Counter(item.nodeid for item in items)
+              output = Path(os.environ['RESEARCH_INVENTORY_PATH'])
+              with output.open('w', newline='', encoding='utf-8') as file:
+                  writer = csv.writer(file)
+                  writer.writerow(['test_id', 'test_name', 'module', 'sha'])
+                  for item in items:
+                      module, sep, rest = item.nodeid.partition('::')
+                      test_name = rest if sep else item.name
+                      writer.writerow([
+                          item.nodeid, test_name, module,
+                          os.environ['RESEARCH_EXPECTED_SHA'],
+                      ])
+              duplicates = {k: v for k, v in counts.items() if v > 1}
+              Path(os.environ['RESEARCH_SUMMARY_PATH']).write_text(
+                  json.dumps({
+                      'collected_items': len(items),
+                      'unique_nodeids': len(counts),
+                      'duplicate_nodeids': duplicates,
+                      'warning': 'Inventory is COMPLETE only when collection-status.txt has exit_code=0.',
+                  }, indent=2, ensure_ascii=False),
+                  encoding='utf-8',
+              )
+          PY
+
+      - name: Install exact project Python dependencies
+        id: install
+        continue-on-error: true
+        env:
+          PROJECT: ${{ matrix.project }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd '${{ matrix.workdir }}'
+          if [[ "$PROJECT" == autogpt ]]; then
+            python -m pip install 'poetry==2.2.1' > "$GITHUB_WORKSPACE/artifacts/tool-install.log" 2>&1
+            tool_rc=$?
+            if [[ "$tool_rc" -eq 0 ]]; then
+              timeout 3600s poetry install --no-interaction --with dev > "$GITHUB_WORKSPACE/artifacts/dependency-install.log" 2>&1
+              rc=$?
+            else
+              echo "Poetry install tool failed: $tool_rc" > "$GITHUB_WORKSPACE/artifacts/dependency-install.log"
+              rc=$tool_rc
+            fi
+          else
+            python -m pip install 'uv==0.13.9' > "$GITHUB_WORKSPACE/artifacts/tool-install.log" 2>&1
+            tool_rc=$?
+            if [[ "$tool_rc" -eq 0 ]]; then
+              # Skyvern's dev group alone omits server/runtime imports used by test modules.
+              timeout 3600s uv sync --locked --extra server --group dev --python "$(command -v python)" > "$GITHUB_WORKSPACE/artifacts/dependency-install.log" 2>&1
+              rc=$?
+            else
+              echo "uv install tool failed: $tool_rc" > "$GITHUB_WORKSPACE/artifacts/dependency-install.log"
+              rc=$tool_rc
+            fi
+          fi
+          echo "exit_code=$rc" > "$GITHUB_WORKSPACE/artifacts/install-status.txt"
+          exit "$rc"
+
+      - name: Generate AutoGPT Prisma client (required for test imports)
+        id: prisma
+        if: matrix.project == 'autogpt' && steps.install.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          # Generation does not connect to this database. Tests will need real
+          # isolated services for execution in a later workflow.
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+          DIRECT_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+        run: |
+          set -uo pipefail
+          cd source/autogpt_platform/backend
+          timeout 1200s poetry run prisma generate > "$GITHUB_WORKSPACE/artifacts/prisma-generate.log" 2>&1
+          rc=$?
+          if [[ "$rc" -eq 0 ]]; then
+            timeout 600s poetry run gen-prisma-stub > "$GITHUB_WORKSPACE/artifacts/prisma-stub.log" 2>&1
+            rc=$?
+          fi
+          echo "exit_code=$rc" > "$GITHUB_WORKSPACE/artifacts/prisma-status.txt"
+          exit "$rc"
+
+      - name: Smoke-check imports with the actual project interpreter
+        id: imports
+        if: steps.install.outcome == 'success' && (matrix.project == 'skyvern' || steps.prisma.outcome == 'success')
+        continue-on-error: true
+        shell: bash
+        env:
+          PROJECT: ${{ matrix.project }}
+        run: |
+          set -uo pipefail
+          cd '${{ matrix.workdir }}'
+          if [[ "$PROJECT" == autogpt ]]; then
+            poetry run python -c 'from prisma import Prisma; import prisma.models; import prisma.enums; print("Prisma imports OK")' > "$GITHUB_WORKSPACE/artifacts/import-check.log" 2>&1
+          else
+            uv run --no-sync python -c 'import anthropic, litellm, sqlalchemy, playwright; print("Skyvern server imports OK")' > "$GITHUB_WORKSPACE/artifacts/import-check.log" 2>&1
+          fi
+          rc=$?
+          echo "exit_code=$rc" > "$GITHUB_WORKSPACE/artifacts/import-status.txt"
+          exit "$rc"
+
+      # Scoped to this ephemeral runner; do not commit a real encryption key.
+      - name: Generate temporary encryption key for AutoGPT collection
+        if: steps.imports.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source/autogpt_platform/backend
+          key="$(poetry run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+          echo "::add-mask::$key"
+          printf 'ENCRYPTION_KEY=%s\n' "$key" >> "$GITHUB_ENV"
+          echo 'A fresh, masked Fernet key was generated for this CI run.'
+
+      - name: Collect exact pytest node IDs
+        id: collect
+        if: steps.imports.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          PROJECT: ${{ matrix.project }}
+          RESEARCH_EXPECTED_SHA: ${{ matrix.sha }}
+          RESEARCH_INVENTORY_PATH: ${{ github.workspace }}/artifacts/test-inventory.csv
+          RESEARCH_ERRORS_PATH: ${{ github.workspace }}/artifacts/collection-errors.jsonl
+          RESEARCH_SUMMARY_PATH: ${{ github.workspace }}/artifacts/collection-summary.json
+          PYTHONPATH: ${{ github.workspace }}
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+          DIRECT_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+        run: |
+          set -uo pipefail
+          cd '${{ matrix.workdir }}'
+          if [[ "$PROJECT" == autogpt ]]; then
+            timeout 2200s poetry run python -m pytest -p research_pytest_export --collect-only -q --continue-on-collection-errors > "$GITHUB_WORKSPACE/artifacts/collection.log" 2>&1
+          else
+            timeout 2200s uv run --no-sync python -m pytest -p research_pytest_export --collect-only -q --continue-on-collection-errors > "$GITHUB_WORKSPACE/artifacts/collection.log" 2>&1
+          fi
+          rc=$?
+          echo "exit_code=$rc" > "$GITHUB_WORKSPACE/artifacts/collection-status.txt"
+          exit "$rc"
+
+      - name: Save versions for reproducibility
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          PROJECT: ${{ matrix.project }}
+        run: |
+          cd '${{ matrix.workdir }}'
+          if [[ "$PROJECT" == autogpt ]]; then
+            poetry run python -m pip freeze > "$GITHUB_WORKSPACE/artifacts/python-packages.txt" 2>&1 || true
+          else
+            uv run --no-sync python -m pip freeze > "$GITHUB_WORKSPACE/artifacts/python-packages.txt" 2>&1 || true
+          fi
+
+      - name: Upload artifacts even when collection fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-collection-autogpt-encryption-fixed
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Reflect true outcome (do not treat partial inventory as success)
+        if: always()
+        shell: bash
+        env:
+          PROJECT: ${{ matrix.project }}
+          INSTALL: ${{ steps.install.outcome }}
+          PRISMA: ${{ steps.prisma.outcome }}
+          IMPORTS: ${{ steps.imports.outcome }}
+          COLLECTION: ${{ steps.collect.outcome }}
+        run: |
+          echo "project=$PROJECT install=$INSTALL prisma=$PRISMA imports=$IMPORTS collection=$COLLECTION"
+          test "$INSTALL" = success
+          if [[ "$PROJECT" == autogpt ]]; then test "$PRISMA" = success; fi
+          test "$IMPORTS" = success
+          test "$COLLECTION" = success
