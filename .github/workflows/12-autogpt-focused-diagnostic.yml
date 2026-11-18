@@ -1,0 +1,277 @@
+name: AutoGPT Focused Failure and Hang Diagnostic (Step 12)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci_copilot
+      DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci_copilot
+      DATABASE_NAME: ci_copilot
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_VHOST: ci-copilot
+      REDIS_HOST: localhost
+      REDIS_PORT: '17000'
+      TRIAL_TEST_DATABASE: '1'
+      CI: 'true'
+      PLAIN_OUTPUT: 'True'
+      EXECUTION_MANAGER_PORT: '18002'
+      DATABASE_API_PORT: '18005'
+      AGENT_API_PORT: '18006'
+      EXECUTION_SCHEDULER_PORT: '18003'
+      NOTIFICATION_SERVICE_PORT: '18007'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+      SKILLS_CATALOG_PATH: ${{ github.workspace }}/skills-catalog
+    services:
+      rabbitmq:
+        image: rabbitmq:4.1.4
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+      falkordb:
+        image: falkordb/falkordb:v4.18.9
+        env:
+          REDIS_ARGS: "--requirepass local-dev-password"
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli -a local-dev-password ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      clamav:
+        image: clamav/clamav-debian:latest
+        env:
+          CLAMAV_NO_FRESHCLAMD: 'false'
+        ports:
+          - 3310:3310
+        options: >-
+          --health-cmd "clamdscan --version || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 8
+          --health-start-period 180s
+
+    steps:
+      - name: Checkout researcher repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact AutoGPT commit
+        uses: actions/checkout@v4
+        with:
+          repository: Significant-Gravitas/AutoGPT
+          ref: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+          path: source
+          persist-credentials: false
+      - name: Checkout skills catalog (needed by upstream CI)
+        uses: actions/checkout@v4
+        with:
+          repository: Significant-Gravitas/skills-catalog
+          ref: a5dc0724d9d3b51448d59eb89bf64568cb83178a
+          path: skills-catalog
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify SHA and initialise diagnostic folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = '39856ae4533ce7025647dfc6e899a1c56f1324e5'
+          {
+            echo "commit=$actual"
+            date -u '+utc=%FT%TZ'
+            python --version
+            nproc
+            free -h
+          } > diagnostics/environment.txt
+      - name: Start PostgreSQL and three-node Redis cluster
+        shell: bash
+        working-directory: source/autogpt_platform
+        run: |
+          set -euo pipefail
+          docker run -d --name postgres-test \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres \
+            -p 5432:5432 \
+            -v "$(pwd)/db/init/00-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro" \
+            pgvector/pgvector:pg15
+          ready=0
+          for i in $(seq 1 50); do
+            if docker exec postgres-test pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1 || { docker logs postgres-test; exit 1; }
+          docker exec postgres-test createdb -h 127.0.0.1 -U postgres "$DATABASE_NAME"
+          docker exec postgres-test psql -h 127.0.0.1 -U postgres -d "$DATABASE_NAME" \
+            -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/00-init.sql
+          docker network create redis-cluster-ci
+          for i in 0 1 2; do
+            port=$((17000+i)); bus=$((27000+i)); name="redis-ci-$i"
+            docker run -d --name "$name" --network redis-cluster-ci --network-alias "$name" \
+              -p "$port:$port" redis:7 \
+              redis-server --port "$port" --cluster-enabled yes \
+              --cluster-config-file nodes.conf --cluster-node-timeout 5000 \
+              --cluster-require-full-coverage no --cluster-announce-hostname "$name" \
+              --cluster-announce-port "$port" --cluster-announce-bus-port "$bus" \
+              --cluster-preferred-endpoint-type hostname
+          done
+          for i in 0 1 2; do
+            port=$((17000+i)); name="redis-ci-$i"; ready=0
+            for j in $(seq 1 30); do
+              if docker exec "$name" redis-cli -p "$port" ping 2>/dev/null | grep -q '^PONG$'; then ready=1; break; fi
+              sleep 2
+            done
+            test "$ready" = 1 || { docker logs "$name"; exit 1; }
+          done
+          docker run --rm --network redis-cluster-ci redis:7 redis-cli --cluster create \
+            redis-ci-0:17000 redis-ci-1:17001 redis-ci-2:17002 \
+            --cluster-replicas 0 --cluster-yes
+          ready=0
+          for i in $(seq 1 30); do
+            if docker exec redis-ci-0 redis-cli -p 17000 cluster info | grep -q 'cluster_state:ok'; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1 || { docker exec redis-ci-0 redis-cli -p 17000 cluster info; exit 1; }
+          docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl add_vhost "$RABBITMQ_VHOST"
+          docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl set_permissions \
+            -p "$RABBITMQ_VHOST" guest '.*' '.*' '.*'
+      - name: Install dependencies and generate Prisma client
+        shell: bash
+        working-directory: source/autogpt_platform/backend
+        run: |
+          set -euo pipefail
+          python -m pip install 'poetry==2.2.1' > "$GITHUB_WORKSPACE/diagnostics/install-tools.log" 2>&1
+          poetry install --no-interaction --with dev > "$GITHUB_WORKSPACE/diagnostics/install-dependencies.log" 2>&1
+          poetry run prisma generate > "$GITHUB_WORKSPACE/diagnostics/prisma-generate.log" 2>&1
+          poetry run gen-prisma-stub > "$GITHUB_WORKSPACE/diagnostics/prisma-stub.log" 2>&1
+          poetry run prisma migrate deploy > "$GITHUB_WORKSPACE/diagnostics/prisma-migrate.log" 2>&1
+      - name: Generate ephemeral test keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(openssl rand -base64 32 | tr '+/' '-_')"
+          echo "::add-mask::$key"
+          echo "ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+          secret="$(openssl rand -base64 32 | tr '+/' '-_')"
+          echo "::add-mask::$secret"
+          echo "UNSUBSCRIBE_SECRET_KEY=$secret" >> "$GITHUB_ENV"
+      - name: Record environment and installed service state
+        shell: bash
+        run: |
+          git -C skills-catalog rev-parse HEAD > diagnostics/skills-catalog-commit.txt
+          docker ps --format '{{.Names}} {{.Status}}' > diagnostics/docker-services.txt
+          python --version >> diagnostics/environment.txt
+          echo 'scope=AutoGPT Python focused diagnostic; NOT full-suite execution' >> diagnostics/environment.txt
+          echo 'per_invocation_timeout_seconds=100' >> diagnostics/environment.txt
+      - name: Install focused pytest report plugin and runner
+        shell: bash
+        run: |
+          mkdir -p diag_tools
+          cat > diag_tools/research_diag.py <<'PY'
+          import json, os
+          from pathlib import Path
+
+          def pytest_runtest_logreport(report):
+              dst=Path(os.environ['DIAG_PHASE_FILE'])
+              rec={'test_id':report.nodeid,'phase':report.when,'outcome':report.outcome,
+                   'duration_s':round(report.duration,6)}
+              if report.failed: rec['error']=str(report.longrepr)
+              with dst.open('a',encoding='utf-8') as f:
+                  f.write(json.dumps(rec,ensure_ascii=False)+'\n')
+          PY
+          cat > diag_tools/runner.py <<'PY'
+          import csv, json, os, signal, subprocess, time
+          from pathlib import Path
+
+          root=Path(os.environ['GITHUB_WORKSPACE'])/'diagnostics'
+          tests=[
+              'backend/util/service_test.py::test_graceful_shutdown',
+              'backend/util/service_test.py::test_health_check_during_shutdown',
+              'backend/api/features/experts/avatar_catalog_test.py::test_each_builtin_seeds_its_own_managed_identity',
+              'backend/data/subscription_trial_cost_integration_test.py::test_attributed_cost_survives_status_and_card_changes[active]',
+          ]
+          limit=100
+          records=[]
+          for index,test in enumerate(tests,1):
+              for repeat in (1,2):
+                  tag=f'test{index:02d}_run{repeat:02d}'
+                  log=root/(tag+'.log'); phase=root/(tag+'.jsonl')
+                  cmd=['poetry','run','python','-m','pytest','-vv','-s','--tb=short',
+                       '-p','research_diag','-p','no:cacheprovider',test]
+                  env=dict(os.environ)
+                  env['PYTHONPATH']=str(Path(os.environ['GITHUB_WORKSPACE'])/'diag_tools')
+                  env['DIAG_PHASE_FILE']=str(phase)
+                  t0=time.monotonic(); timed_out=False
+                  with log.open('w',encoding='utf-8') as f:
+                      f.write('TARGET: '+test+'\nCOMMAND: '+repr(cmd)+'\n')
+                      f.flush()
+                      process=subprocess.Popen(cmd,stdout=f,stderr=subprocess.STDOUT,
+                                               env=env,start_new_session=True)
+                      try: code=process.wait(timeout=limit)
+                      except subprocess.TimeoutExpired:
+                          timed_out=True
+                          os.killpg(process.pid,signal.SIGINT)
+                          try: code=process.wait(timeout=8)
+                          except subprocess.TimeoutExpired:
+                              os.killpg(process.pid,signal.SIGTERM)
+                              try: code=process.wait(timeout=5)
+                              except subprocess.TimeoutExpired:
+                                  os.killpg(process.pid,signal.SIGKILL)
+                                  code=process.wait()
+                          f.write('\nINVOCATION_TIME_LIMIT_REACHED\n')
+                  reports=[]
+                  if phase.exists():
+                      for line in phase.read_text(encoding='utf-8').splitlines():
+                          try: reports.append(json.loads(line))
+                          except json.JSONDecodeError: pass
+                  if timed_out: out='N'  # interrupted invocation: no reliable completed test result
+                  elif any(r['outcome']=='failed' for r in reports): out='0'
+                  elif any(r['outcome']=='skipped' for r in reports): out='S'
+                  elif any(r['phase']=='call' and r['outcome']=='passed' for r in reports) and any(r['phase']=='teardown' and r['outcome']=='passed' for r in reports): out='1'
+                  else: out='N'
+                  record={'test_id':test,'repeat':repeat,'outcome':out,'timed_out':timed_out,
+                          'exit_code':code,'wall_seconds':round(time.monotonic()-t0,3),
+                          'log_file':log.name,'phase_file':phase.name}
+                  records.append(record)
+                  print(json.dumps(record),flush=True)
+          with (root/'diagnostic-outcomes.csv').open('w',newline='',encoding='utf-8') as f:
+              writer=csv.DictWriter(f,fieldnames=list(records[0]))
+              writer.writeheader();writer.writerows(records)
+          (root/'diagnostic-summary.json').write_text(json.dumps({
+              'scope':'four target tests repeated twice each in isolation; not full suite',
+              'commit':'39856ae4533ce7025647dfc6e899a1c56f1324e5',
+              'skills_catalog_commit':'a5dc0724d9d3b51448d59eb89bf64568cb83178a',
+              'invocation_timeout_seconds':limit,'results':records},indent=2))
+          PY
+      - name: Run representative failures and hanging tests twice in isolation
+        shell: bash
+        working-directory: source/autogpt_platform/backend
+        run: |
+          poetry run python "$GITHUB_WORKSPACE/diag_tools/runner.py"
+      - name: Upload complete diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autogpt-focused-diagnostic-step12
+          path: diagnostics/
+          retention-days: 14
+          if-no-files-found: warn
