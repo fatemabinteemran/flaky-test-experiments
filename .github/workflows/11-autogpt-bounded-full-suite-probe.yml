@@ -1,0 +1,327 @@
+name: AutoGPT Bounded Full Python Suite Probe (Step 11)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suite-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci_copilot
+      DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci_copilot
+      DATABASE_NAME: ci_copilot
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_VHOST: ci-copilot
+      REDIS_HOST: localhost
+      REDIS_PORT: '17000'
+      TRIAL_TEST_DATABASE: '1'
+      CI: 'true'
+      PLAIN_OUTPUT: 'True'
+      EXECUTION_MANAGER_PORT: '18002'
+      DATABASE_API_PORT: '18005'
+      AGENT_API_PORT: '18006'
+      EXECUTION_SCHEDULER_PORT: '18003'
+      NOTIFICATION_SERVICE_PORT: '18007'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+      SKILLS_CATALOG_PATH: ${{ github.workspace }}/skills-catalog
+    services:
+      rabbitmq:
+        image: rabbitmq:4.1.4
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+      falkordb:
+        image: falkordb/falkordb:v4.18.9
+        env:
+          REDIS_ARGS: "--requirepass local-dev-password"
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli -a local-dev-password ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      clamav:
+        image: clamav/clamav-debian:latest
+        env:
+          CLAMAV_NO_FRESHCLAMD: 'false'
+        ports:
+          - 3310:3310
+        options: >-
+          --health-cmd "clamdscan --version || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 8
+          --health-start-period 180s
+
+    steps:
+      - name: Checkout researcher repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact AutoGPT commit
+        uses: actions/checkout@v4
+        with:
+          repository: Significant-Gravitas/AutoGPT
+          ref: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+          path: source
+          persist-credentials: false
+      - name: Checkout skills catalog (needed by upstream CI)
+        uses: actions/checkout@v4
+        with:
+          repository: Significant-Gravitas/skills-catalog
+          path: skills-catalog
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify SHA and initialise diagnostic folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = '39856ae4533ce7025647dfc6e899a1c56f1324e5'
+          {
+            echo "commit=$actual"
+            date -u '+utc=%FT%TZ'
+            python --version
+            nproc
+            free -h
+          } > diagnostics/environment.txt
+      - name: Start PostgreSQL and three-node Redis cluster
+        shell: bash
+        working-directory: source/autogpt_platform
+        run: |
+          set -euo pipefail
+          docker run -d --name postgres-test \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres \
+            -p 5432:5432 \
+            -v "$(pwd)/db/init/00-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro" \
+            pgvector/pgvector:pg15
+          ready=0
+          for i in $(seq 1 50); do
+            if docker exec postgres-test pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1 || { docker logs postgres-test; exit 1; }
+          docker exec postgres-test createdb -h 127.0.0.1 -U postgres "$DATABASE_NAME"
+          docker exec postgres-test psql -h 127.0.0.1 -U postgres -d "$DATABASE_NAME" \
+            -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/00-init.sql
+          docker network create redis-cluster-ci
+          for i in 0 1 2; do
+            port=$((17000+i)); bus=$((27000+i)); name="redis-ci-$i"
+            docker run -d --name "$name" --network redis-cluster-ci --network-alias "$name" \
+              -p "$port:$port" redis:7 \
+              redis-server --port "$port" --cluster-enabled yes \
+              --cluster-config-file nodes.conf --cluster-node-timeout 5000 \
+              --cluster-require-full-coverage no --cluster-announce-hostname "$name" \
+              --cluster-announce-port "$port" --cluster-announce-bus-port "$bus" \
+              --cluster-preferred-endpoint-type hostname
+          done
+          for i in 0 1 2; do
+            port=$((17000+i)); name="redis-ci-$i"; ready=0
+            for j in $(seq 1 30); do
+              if docker exec "$name" redis-cli -p "$port" ping 2>/dev/null | grep -q '^PONG$'; then ready=1; break; fi
+              sleep 2
+            done
+            test "$ready" = 1 || { docker logs "$name"; exit 1; }
+          done
+          docker run --rm --network redis-cluster-ci redis:7 redis-cli --cluster create \
+            redis-ci-0:17000 redis-ci-1:17001 redis-ci-2:17002 \
+            --cluster-replicas 0 --cluster-yes
+          ready=0
+          for i in $(seq 1 30); do
+            if docker exec redis-ci-0 redis-cli -p 17000 cluster info | grep -q 'cluster_state:ok'; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1 || { docker exec redis-ci-0 redis-cli -p 17000 cluster info; exit 1; }
+          docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl add_vhost "$RABBITMQ_VHOST"
+          docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl set_permissions \
+            -p "$RABBITMQ_VHOST" guest '.*' '.*' '.*'
+      - name: Install dependencies and generate Prisma client
+        shell: bash
+        working-directory: source/autogpt_platform/backend
+        run: |
+          set -euo pipefail
+          python -m pip install 'poetry==2.2.1' > "$GITHUB_WORKSPACE/diagnostics/install-tools.log" 2>&1
+          poetry install --no-interaction --with dev > "$GITHUB_WORKSPACE/diagnostics/install-dependencies.log" 2>&1
+          poetry run prisma generate > "$GITHUB_WORKSPACE/diagnostics/prisma-generate.log" 2>&1
+          poetry run gen-prisma-stub > "$GITHUB_WORKSPACE/diagnostics/prisma-stub.log" 2>&1
+          poetry run prisma migrate deploy > "$GITHUB_WORKSPACE/diagnostics/prisma-migrate.log" 2>&1
+      - name: Generate ephemeral test keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(openssl rand -base64 32 | tr '+/' '-_')"
+          echo "::add-mask::$key"
+          echo "ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+          secret="$(openssl rand -base64 32 | tr '+/' '-_')"
+          echo "::add-mask::$secret"
+          echo "UNSUBSCRIBE_SECRET_KEY=$secret" >> "$GITHUB_ENV"
+      - name: Record pinned environment and service status
+        shell: bash
+        run: |
+          git -C skills-catalog rev-parse HEAD > diagnostics/skills-catalog-commit.txt
+          docker ps --format '{{.Names}} {{.Status}}' > diagnostics/docker-services.txt
+          python --version >> diagnostics/environment.txt
+          echo 'scope=AutoGPT Python only; one bounded full-suite attempt' >> diagnostics/environment.txt
+          echo 'time_budget_seconds=720' >> diagnostics/environment.txt
+      - name: Install full-suite probe
+        shell: bash
+        run: |
+          mkdir -p probe_tools
+          cat > probe_tools/research_probe.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['PROBE_OUTPUT_DIR'])
+
+          def pytest_collection_finish(session):
+              with (root/'collected-nodeids.jsonl').open('w', encoding='utf-8') as f:
+                  for item in session.items:
+                      f.write(json.dumps(item.nodeid, ensure_ascii=False) + '\n')
+              (root/'collection-count.txt').write_text(str(len(session.items)) + '\n')
+
+          def pytest_collectreport(report):
+              if report.failed:
+                  with (root/'collection-errors.jsonl').open('a', encoding='utf-8') as f:
+                      f.write(json.dumps({'nodeid': report.nodeid, 'error': str(report.longrepr)}, ensure_ascii=False)+'\n')
+
+          def pytest_runtest_logreport(report):
+              record = {
+                  'test_id': report.nodeid,
+                  'phase': report.when,
+                  'outcome': report.outcome,
+                  'duration_s': round(report.duration, 6),
+                  'wasxfail': bool(getattr(report, 'wasxfail', False))
+              }
+              if report.failed:
+                  record['error'] = str(report.longrepr)
+              with (root/'phase-reports.jsonl').open('a', encoding='utf-8') as f:
+                  f.write(json.dumps(record, ensure_ascii=False) + '\n')
+          PY
+      - name: Run bounded full suite and retain every observed outcome
+        shell: bash
+        working-directory: source/autogpt_platform/backend
+        env:
+          PROBE_OUTPUT_DIR: ${{ github.workspace }}/diagnostics
+          PYTHONPATH: ${{ github.workspace }}/probe_tools
+        run: |
+          cat > "$GITHUB_WORKSPACE/probe_tools/probe_runner.py" <<'PY'
+          import collections
+          import csv
+          import json
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          root=Path(os.environ['PROBE_OUTPUT_DIR'])
+          root.mkdir(parents=True,exist_ok=True)
+          limit=720  # 12 minutes of pytest execution; setup/installation excluded
+          cmd=['poetry','run','python','-m','pytest','-q','-vv','--tb=long',
+               '-p','research_probe','-p','no:cacheprovider']
+          env=dict(os.environ)
+          env['PROBE_OUTPUT_DIR']=str(root)
+          start=time.monotonic()
+          timed_out=False
+          with (root/'full-suite-pytest.log').open('w', encoding='utf-8') as log:
+              log.write('COMMAND: '+repr(cmd)+'\nTIME_BUDGET_SECONDS='+str(limit)+'\n')
+              log.flush()
+              proc=subprocess.Popen(cmd,stdout=log,stderr=subprocess.STDOUT,
+                                    env=env,start_new_session=True)
+              try:
+                  exit_code=proc.wait(timeout=limit)
+              except subprocess.TimeoutExpired:
+                  timed_out=True
+                  os.killpg(proc.pid,signal.SIGINT)
+                  try:
+                      exit_code=proc.wait(timeout=20)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(proc.pid,signal.SIGTERM)
+                      try:
+                          exit_code=proc.wait(timeout=10)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(proc.pid,signal.SIGKILL)
+                          exit_code=proc.wait()
+                  log.write('\nPROBE_TIME_BUDGET_REACHED: whole-suite run not completed.\n')
+          wall=round(time.monotonic()-start,3)
+          collected=[]
+          node_file=root/'collected-nodeids.jsonl'
+          if node_file.exists():
+              for line in node_file.open(encoding='utf-8'):
+                  try:
+                      collected.append(json.loads(line))
+                  except json.JSONDecodeError:
+                      pass
+          phases=collections.defaultdict(list)
+          phase_file=root/'phase-reports.jsonl'
+          if phase_file.exists():
+              for line in phase_file.open(encoding='utf-8'):
+                  try:
+                      record=json.loads(line)
+                      phases[record['test_id']].append(record)
+                  except (ValueError,KeyError):
+                      continue
+
+          # N is neither a pass nor a fail: test not executed, no report, or incomplete.
+          counts=collections.Counter()
+          with (root/'partial-outcomes.csv').open('w',encoding='utf-8',newline='') as f:
+              w=csv.writer(f)
+              w.writerow(['test_id','run','outcome','phase_duration_seconds','note'])
+              for node in collected:
+                  reports=phases.get(node,[])
+                  if any(r['outcome']=='failed' for r in reports):
+                      outcome,note='0','pytest failure/error (includes setup/teardown)'
+                  elif any(r['outcome']=='skipped' for r in reports):
+                      outcome,note='S','pytest skipped/expected failure'
+                  elif (any(r['phase']=='call' and r['outcome']=='passed' for r in reports) and
+                        any(r['phase']=='teardown' and r['outcome']=='passed' for r in reports)):
+                      outcome,note='1','passed (call and teardown)'
+                  else:
+                      outcome,note='N','no complete outcome observed'
+                  counts[outcome]+=1
+                  w.writerow([node,1,outcome,round(sum(r['duration_s'] for r in reports),4),note])
+          summary={
+           'project':'AutoGPT Python backend',
+           'sha':'39856ae4533ce7025647dfc6e899a1c56f1324e5',
+           'scope':'single bounded attempt of entire pytest suite (not one completed full-suite run)',
+           'time_budget_seconds':limit,'invocation_wall_seconds':wall,
+           'timed_out':timed_out,'pytest_exit_code':exit_code,
+           'collected_count':len(collected),'observed_outcomes':dict(counts),
+           'reported_test_ids_not_in_collection':len(set(phases)-set(collected)),
+           'complete_suite_run':bool(exit_code in (0,1) and not timed_out and len(collected)>0 and counts['N']==0 and not (root/'collection-errors.jsonl').exists()),
+          }
+          (root/'probe-summary.json').write_text(json.dumps(summary,indent=2))
+          print(json.dumps(summary,indent=2))
+          if not collected:
+              sys.exit('ERROR: no pytest node IDs collected; inspect full-suite-pytest.log')
+          # Reaching the time budget is a measured outcome, not a GitHub workflow failure.
+          PY
+          poetry run python "$GITHUB_WORKSPACE/probe_tools/probe_runner.py"
+      - name: Upload bounded suite logs and data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autogpt-full-python-suite-bounded-probe
+          path: diagnostics/
+          retention-days: 14
+          if-no-files-found: warn
