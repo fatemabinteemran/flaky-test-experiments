@@ -1,0 +1,165 @@
+name: AutoGPT Frontend Collection Recovery (Pilot)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  autogpt-frontend-recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the pinned AutoGPT commit
+        uses: actions/checkout@v4
+        with:
+          repository: Significant-Gravitas/AutoGPT
+          ref: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+          path: source/autogpt
+          persist-credentials: false
+
+      - name: Verify commit and record environment
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/autogpt
+          actual="$(git -C source/autogpt rev-parse HEAD)"
+          expected="39856ae4533ce7025647dfc6e899a1c56f1324e5"
+          test "$actual" = "$expected"
+          {
+            echo "project=autogpt"
+            echo "repository=Significant-Gravitas/AutoGPT"
+            echo "expected_sha=$expected"
+            echo "actual_sha=$actual"
+            echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner_os=$(uname -a)"
+            echo "cpu_count=$(nproc)"
+            grep '^MemTotal:' /proc/meminfo
+            echo "python=$(python3 --version)"
+          } > artifacts/autogpt/environment.txt
+
+      - name: Set up pnpm (the pinned project's package manager)
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+          cache-dependency-path: source/autogpt/autogpt_platform/frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: source/autogpt/autogpt_platform/frontend
+        run: |
+          pnpm install --frozen-lockfile > "$GITHUB_WORKSPACE/artifacts/autogpt/install.log" 2>&1 || {
+            cat "$GITHUB_WORKSPACE/artifacts/autogpt/install.log"
+            exit 1
+          }
+          {
+            echo "node=$(node --version)"
+            echo "pnpm=$(pnpm --version)"
+            echo "vitest=$(pnpm exec vitest --version)"
+          } >> "$GITHUB_WORKSPACE/artifacts/autogpt/environment.txt"
+
+      - name: Generate API client from the commit's LOCAL OpenAPI file
+        id: api
+        working-directory: source/autogpt/autogpt_platform/frontend
+        run: |
+          set +e
+          # Do not use generate:api:force: it tries an absent localhost:8006 server.
+          test -s src/app/api/openapi.json || exit 2
+          sha256sum src/app/api/openapi.json >> "$GITHUB_WORKSPACE/artifacts/autogpt/environment.txt"
+          start=$(date +%s)
+          pnpm run generate:api > "$GITHUB_WORKSPACE/artifacts/autogpt/api-generation.log" 2>&1
+          rc=$?
+          end=$(date +%s)
+          printf 'exit_code=%s\nduration_seconds=%s\n' "$rc" "$((end-start))" > "$GITHUB_WORKSPACE/artifacts/autogpt/api-generation-status.txt"
+          if [ "$rc" -ne 0 ]; then
+            tail -80 "$GITHUB_WORKSPACE/artifacts/autogpt/api-generation.log"
+          fi
+          exit "$rc"
+
+      - name: Collect individual Vitest test entries
+        id: collect
+        if: steps.api.outcome == 'success'
+        working-directory: source/autogpt/autogpt_platform/frontend
+        run: |
+          set +e
+          start=$(date +%s)
+          pnpm exec vitest list --json="$GITHUB_WORKSPACE/artifacts/autogpt/collected-tests.json" > "$GITHUB_WORKSPACE/artifacts/autogpt/collection.log" 2>&1
+          rc=$?
+          end=$(date +%s)
+          printf 'exit_code=%s\nduration_seconds=%s\n' "$rc" "$((end-start))" > "$GITHUB_WORKSPACE/artifacts/autogpt/collection-status.txt"
+          if [ "$rc" -ne 0 ]; then
+            tail -80 "$GITHUB_WORKSPACE/artifacts/autogpt/collection.log"
+          fi
+          exit "$rc"
+
+      - name: Convert collection to inventory and flag ambiguous duplicates
+        if: steps.collect.outcome == 'success'
+        run: |
+          python3 - <<'PY'
+          import csv, json, pathlib, collections
+          root = pathlib.Path('artifacts/autogpt')
+          tests = json.loads((root/'collected-tests.json').read_text())
+          assert isinstance(tests, list) and tests, 'Missing or empty test collection'
+          prefix = '/source/autogpt/autogpt_platform/frontend/'
+          entries = []
+          for test in tests:
+              file = test['file']
+              name = test['name']
+              relative = file.split(prefix, 1)[-1] if prefix in file else file
+              entries.append((relative, name))
+          counts = collections.Counter(entries)
+          sha = '39856ae4533ce7025647dfc6e899a1c56f1324e5'
+          with (root/'test-inventory.csv').open('w', newline='') as handle:
+              writer = csv.writer(handle)
+              writer.writerow(['test_id', 'test_name', 'module', 'sha', 'duplicate_identifier'])
+              for file, name in entries:
+                  writer.writerow([f'{file}::{name}', name, file, sha, int(counts[(file,name)] > 1)])
+          with (root/'duplicate-identifiers.csv').open('w', newline='') as handle:
+              writer = csv.writer(handle)
+              writer.writerow(['test_id','count'])
+              for (file,name),count in counts.items():
+                  if count > 1:
+                      writer.writerow([f'{file}::{name}',count])
+          (root/'inventory-summary.json').write_text(json.dumps({
+              'collected_entries': len(entries),
+              'unique_file_and_name_keys': len(counts),
+              'extra_entries_with_ambiguous_identifiers': len(entries)-len(counts),
+              'unique_files': len({file for file,_ in entries}),
+              'note': 'This is Vitest frontend only. Duplicate names within a file cannot be individually targeted with -t.'
+          }, indent=2))
+          PY
+
+      - name: Run one sample test file (not 5000 repetitions)
+        if: steps.api.outcome == 'success'
+        working-directory: source/autogpt/autogpt_platform/frontend
+        run: |
+          set +e
+          start=$(date +%s)
+          pnpm exec vitest run src/__tests__/instrumentation-client.test.ts \
+            --reporter=json --outputFile="$GITHUB_WORKSPACE/artifacts/autogpt/sample-run.json" \
+            > "$GITHUB_WORKSPACE/artifacts/autogpt/sample.log" 2>&1
+          rc=$?
+          end=$(date +%s)
+          printf 'exit_code=%s\nduration_seconds=%s\n' "$rc" "$((end-start))" > "$GITHUB_WORKSPACE/artifacts/autogpt/sample-status.txt"
+          if [ "$rc" -ne 0 ]; then
+            tail -80 "$GITHUB_WORKSPACE/artifacts/autogpt/sample.log"
+          fi
+          # Retain failure data without concealing the exit code in the status file.
+          exit 0
+
+      - name: Upload pilot logs and test inventory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autogpt-frontend-recovery
+          path: artifacts/autogpt/
+          if-no-files-found: warn
+          retention-days: 30
