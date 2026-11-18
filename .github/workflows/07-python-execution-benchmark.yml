@@ -1,0 +1,281 @@
+name: Python Execution Benchmark (Small Pilot)
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_suite_probe:
+        description: 'Also attempt one bounded full-suite run per project (150 s max, NOT a completed suite if timed out)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: benchmark-${{ matrix.project }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: autogpt
+            repository: Significant-Gravitas/AutoGPT
+            sha: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+            workdir: source/autogpt_platform/backend
+          - project: skyvern
+            repository: Skyvern-AI/skyvern
+            sha: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+            workdir: source
+
+    steps:
+      - name: Checkout research code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact research subject
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.sha }}
+          path: source
+          persist-credentials: false
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify commit and record machine
+        env:
+          EXPECTED_SHA: ${{ matrix.sha }}
+          PROJECT: ${{ matrix.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_SHA"
+          {
+            echo "project=$PROJECT"
+            echo "commit=$actual"
+            echo "utc=$(date -u +%FT%TZ)"
+            echo "runner_image=${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            python --version
+            nproc
+            free -h
+            uname -a
+          } > artifacts/environment.txt
+      - name: Install pinned-project dependencies
+        id: install
+        env:
+          PROJECT: ${{ matrix.project }}
+          WORKDIR: ${{ matrix.workdir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORKDIR"
+          if [[ "$PROJECT" == autogpt ]]; then
+            python -m pip install 'poetry==2.2.1' > "$GITHUB_WORKSPACE/artifacts/tool-install.log" 2>&1
+            timeout 1200s poetry install --no-interaction --with dev > "$GITHUB_WORKSPACE/artifacts/dependency-install.log" 2>&1
+          else
+            python -m pip install 'uv==0.13.9' > "$GITHUB_WORKSPACE/artifacts/tool-install.log" 2>&1
+            timeout 1200s uv sync --locked --extra server --group dev --python "$(command -v python)" > "$GITHUB_WORKSPACE/artifacts/dependency-install.log" 2>&1
+          fi
+      - name: Generate Prisma for AutoGPT
+        if: matrix.project == 'autogpt'
+        shell: bash
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+          DIRECT_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+        run: |
+          set -euo pipefail
+          cd source/autogpt_platform/backend
+          timeout 400s poetry run prisma generate > "$GITHUB_WORKSPACE/artifacts/prisma.log" 2>&1
+          timeout 240s poetry run gen-prisma-stub > "$GITHUB_WORKSPACE/artifacts/prisma-stub.log" 2>&1
+          key="$(poetry run python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+          echo "::add-mask::$key"
+          echo "ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+      - name: Write exact-test selector and result recorder
+        shell: bash
+        run: |
+          cat > research_bench_plugin.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import pytest
+
+          TARGETS_VAR = 'BENCH_TARGETS_FILE'
+          REPORT_VAR = 'BENCH_REPORT_FILE'
+
+          def pytest_collection_modifyitems(session, config, items):
+              filename = os.environ.get(TARGETS_VAR)
+              if not filename:
+                  return  # Full-suite probe only. No selection or deselection.
+              targets = set(json.loads(Path(filename).read_text(encoding='utf-8')))
+              chosen = [item for item in items if item.nodeid in targets]
+              unchosen = [item for item in items if item.nodeid not in targets]
+              if unchosen:
+                  config.hook.pytest_deselected(items=unchosen)
+              items[:] = chosen
+              Path(os.environ['BENCH_SELECTED_FILE']).write_text(
+                  json.dumps({'requested': len(targets), 'found': len(chosen),
+                              'nodeids': [item.nodeid for item in chosen]}),
+                  encoding='utf-8',
+              )
+
+          def pytest_runtest_logreport(report):
+              output = os.environ.get(REPORT_VAR)
+              if not output:
+                  return
+              record = {
+                  'test_id': report.nodeid, 'phase': report.when,
+                  'outcome': report.outcome, 'duration_seconds': report.duration,
+                  'expected_failure': bool(getattr(report, 'wasxfail', False)),
+              }
+              if report.failed:
+                  record['error'] = str(report.longrepr)[:30000]
+              with Path(output).open('a', encoding='utf-8') as f:
+                  f.write(json.dumps(record, ensure_ascii=False) + '\n')
+          PY
+      - name: Run small isolation and suite-subset benchmarks
+        id: execute
+        continue-on-error: true
+        shell: bash
+        env:
+          PROJECT: ${{ matrix.project }}
+          WORKDIR: ${{ matrix.workdir }}
+          BENCH_ROOT: ${{ github.workspace }}
+          FULL_SUITE_PROBE: ${{ inputs.full_suite_probe }}
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+          DIRECT_URL: postgresql://postgres:postgres@localhost:5432/autogpt_test
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          cat > run_bench.py <<'PY'
+          import csv
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+
+          project = os.environ['PROJECT']
+          workspace = Path(os.environ['BENCH_ROOT']).resolve()
+          cwd = (workspace / os.environ['WORKDIR']).resolve()
+          dest = workspace / 'artifacts'
+          dest.mkdir(exist_ok=True)
+          roots = cwd.parent if project == 'autogpt' else cwd
+          cmd_prefix = ['poetry', 'run', 'python'] if project == 'autogpt' else ['uv', 'run', '--no-sync', 'python']
+          targets = {
+              'autogpt': [
+                  'backend/copilot/executor/utils_test.py::TestCoPilotExecutionEntry::test_basic_fields',
+                  'backend/copilot/executor/utils_test.py::TestCoPilotExecutionEntry::test_optional_fields',
+                  'backend/copilot/executor/utils_test.py::TestCancelCoPilotEvent::test_serialization',
+              ],
+              'skyvern': [
+                  'skyvern/forge/sdk/api/llm/utils_test.py::TestLoadsWithRepair::test_valid_json_passes_through',
+                  'skyvern/forge/sdk/api/llm/utils_test.py::TestLoadsWithRepair::test_invalid_control_character_does_not_raise',
+                  'skyvern/forge/sdk/api/llm/utils_test.py::TestLoadsWithRepair::test_unescaped_quote_in_value_does_not_raise',
+              ],
+          }[project]
+          def classify(reports, exitcode):
+              if not reports:
+                  return 'N'
+              if any(r['outcome'] == 'failed' for r in reports):
+                  return '0'
+              if any(r['outcome'] == 'skipped' for r in reports):
+                  return 'S'
+              if exitcode == 0 and any(r['phase'] == 'call' and r['outcome'] == 'passed' for r in reports):
+                  return '1'
+              return 'N'
+
+          rows = []
+          def execute(label, chosen, iteration, timeout_seconds, full=False):
+              stem = f'{label}-run{iteration}'
+              report_file = dest / f'{stem}-stages.jsonl'
+              target_file = dest / f'{stem}-targets.json'
+              selected_file = dest / f'{stem}-selected.json'
+              env = dict(os.environ)
+              env['BENCH_REPORT_FILE'] = str(report_file)
+              env['BENCH_SELECTED_FILE'] = str(selected_file)
+              files = sorted({str((roots / t.split('::', 1)[0]).resolve()) for t in chosen})
+              if full:
+                  env.pop('BENCH_TARGETS_FILE', None)
+                  files = []
+              else:
+                  target_file.write_text(json.dumps(chosen), encoding='utf-8')
+                  env['BENCH_TARGETS_FILE'] = str(target_file)
+              command = cmd_prefix + ['-m', 'pytest', '-p', 'research_bench_plugin', '-q', '--tb=long'] + files
+              start = time.monotonic()
+              with (dest / f'{stem}.log').open('w', encoding='utf-8') as log:
+                  try:
+                      done = subprocess.run(command, cwd=cwd, env=env, stdout=log,
+                                            stderr=subprocess.STDOUT, timeout=timeout_seconds)
+                      code = done.returncode
+                      timed_out = False
+                  except subprocess.TimeoutExpired:
+                      code = 124
+                      timed_out = True
+                      log.write(f'\nRESEARCH TIMEOUT after {timeout_seconds}s; incomplete run.\n')
+              elapsed = round(time.monotonic() - start, 2)
+              stage_data = []
+              if report_file.exists():
+                  for line in report_file.read_text(encoding='utf-8').splitlines():
+                      try: stage_data.append(json.loads(line))
+                      except json.JSONDecodeError: pass
+              selected = json.loads(selected_file.read_text()) if selected_file.exists() else None
+              if not full:
+                  for test in chosen:
+                      test_reports = [r for r in stage_data if r['test_id'] == test]
+                      rows.append({'project':project,'setting':label,'run':iteration,
+                                   'test_id':test,'outcome':classify(test_reports,code),
+                                   'test_duration_seconds':round(sum(r['duration_seconds'] for r in test_reports),4),
+                                   'invocation_wall_seconds':elapsed,'pytest_exit_code':code,
+                                   'timed_out':timed_out,'selected_count':selected['found'] if selected else -1,
+                                   'log_file':f'{stem}.log'})
+              return {'project':project,'setting':label,'run':iteration,
+                      'duration_seconds':elapsed,'exit_code':code,'timed_out':timed_out,
+                      'selected':selected,'recorded_report_phases':len(stage_data),
+                      'complete':code in (0,1) and not timed_out and bool(stage_data)}
+
+          summary = []
+          for i, test in enumerate(targets):
+              for repetition in (1,2):
+                  summary.append(execute(f'isolation-{i+1}', [test], repetition, 80))
+          # This is a 3-test subset, NOT a full test suite and NOT formal full-suite data.
+          for repetition in (1,2):
+              summary.append(execute('suite-subset', targets, repetition, 120))
+          if os.environ.get('FULL_SUITE_PROBE', 'false').lower() == 'true':
+              # Only a time-limited reconnaissance; if timed out it is INCOMPLETE.
+              summary.append(execute('bounded-full-suite-probe', [], 1, 150, full=True))
+          with (dest / 'bench-results.csv').open('w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=['project','setting','run','test_id','outcome',
+                   'test_duration_seconds','invocation_wall_seconds','pytest_exit_code','timed_out','selected_count','log_file'])
+              w.writeheader(); w.writerows(rows)
+          (dest / 'benchmark-summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print('BENCHMARK SUMMARY:', json.dumps(summary, indent=2))
+          print('OUTCOME COUNTS:', {v: sum(r['outcome']==v for r in rows) for v in ('1','0','S','N')})
+          # Infra errors must not masquerade as a successful benchmark.
+          if any(s['setting'] != 'bounded-full-suite-probe' and
+                 (not s['selected'] or s['selected']['found'] != s['selected']['requested']) for s in summary):
+              raise SystemExit('ERROR: One or more benchmark test IDs could not be selected.')
+          PY
+          python run_bench.py > artifacts/benchmark-console.log 2>&1
+      - name: Preserve logs and data (even after failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-execution-benchmark-${{ matrix.project }}
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Report setup or benchmark infrastructure failure
+        if: always()
+        env:
+          INSTALL: ${{ steps.install.outcome }}
+          EXECUTE: ${{ steps.execute.outcome }}
+        run: |
+          echo "dependency_install=$INSTALL benchmark=$EXECUTE"
+          test "$INSTALL" = success
+          test "$EXECUTE" = success
