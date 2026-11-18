@@ -1,0 +1,161 @@
+name: Frontend Test Collection (Pilot)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    name: "collect-${{ matrix.project }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: autogpt
+            repository: Significant-Gravitas/AutoGPT
+            sha: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+            frontend: autogpt_platform/frontend
+            sample: src/__tests__/instrumentation-client.test.ts
+          - project: skyvern
+            repository: Skyvern-AI/skyvern
+            sha: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+            frontend: skyvern-frontend
+            sample: src/api/artifactUrls.test.ts
+
+    steps:
+      - name: Prepare output folder
+        env:
+          PROJECT: ${{ matrix.project }}
+          SHA: ${{ matrix.sha }}
+          REPOSITORY: ${{ matrix.repository }}
+        run: |
+          mkdir -p "artifacts/$PROJECT"
+          {
+            echo "project=$PROJECT"
+            echo "repository=$REPOSITORY"
+            echo "expected_sha=$SHA"
+            echo "runner_os=$(uname -a)"
+            echo "cpu_count=$(nproc)"
+            grep '^MemTotal:' /proc/meminfo || true
+            date -u +'%Y-%m-%dT%H:%M:%SZ'
+          } > "artifacts/$PROJECT/environment.txt"
+
+      - name: Check out exact professor-specified commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify commit
+        env:
+          PROJECT: ${{ matrix.project }}
+          EXPECTED: ${{ matrix.sha }}
+        run: |
+          ACTUAL=$(git -C source rev-parse HEAD)
+          echo "actual_sha=$ACTUAL" | tee -a "artifacts/$PROJECT/environment.txt"
+          test "$ACTUAL" = "$EXPECTED"
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install project frontend dependencies
+        env:
+          PROJECT: ${{ matrix.project }}
+          FRONTEND: ${{ matrix.frontend }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "source/$FRONTEND"
+          echo "node=$(node --version)" >> "$GITHUB_WORKSPACE/artifacts/$PROJECT/environment.txt"
+          echo "npm=$(npm --version)" >> "$GITHUB_WORKSPACE/artifacts/$PROJECT/environment.txt"
+          if [ "$PROJECT" = autogpt ]; then
+            npm install --global pnpm@10.20.0
+            echo "pnpm=$(pnpm --version)" >> "$GITHUB_WORKSPACE/artifacts/$PROJECT/environment.txt"
+            pnpm install --frozen-lockfile 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/$PROJECT/install.log"
+          else
+            npm ci --no-audit --no-fund 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/$PROJECT/install.log"
+          fi
+          test -x node_modules/.bin/vitest
+          node_modules/.bin/vitest --version | tee -a "$GITHUB_WORKSPACE/artifacts/$PROJECT/environment.txt"
+
+      - name: Generate AutoGPT frontend API code (if needed)
+        if: matrix.project == 'autogpt'
+        continue-on-error: true
+        env:
+          PROJECT: ${{ matrix.project }}
+          FRONTEND: ${{ matrix.frontend }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "source/$FRONTEND"
+          timeout 300s pnpm run generate:api:force 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/$PROJECT/api-generation.log"
+
+      - name: Collect Vitest test identifiers (not a 5000-run experiment)
+        id: collect_tests
+        continue-on-error: true
+        env:
+          PROJECT: ${{ matrix.project }}
+          FRONTEND: ${{ matrix.frontend }}
+        shell: bash
+        run: |
+          cd "source/$FRONTEND"
+          OUT="$GITHUB_WORKSPACE/artifacts/$PROJECT"
+          echo "collection_command=vitest list --json=<output>" >> "$OUT/environment.txt"
+          START=$(date +%s)
+          set +e
+          timeout --signal=TERM --kill-after=30s 2400s \
+            ./node_modules/.bin/vitest list --json="$OUT/collected-tests.json" \
+            > "$OUT/collection.log" 2>&1
+          RC=$?
+          set -e
+          END=$(date +%s)
+          printf 'exit_code=%s\nduration_seconds=%s\n' "$RC" "$((END-START))" \
+            > "$OUT/collection-status.txt"
+          echo "Collection exit: $RC; duration: $((END-START)) s"
+          tail -n 35 "$OUT/collection.log" || true
+          exit "$RC"
+
+      - name: One-file execution benchmark (NOT full suite)
+        id: sample
+        continue-on-error: true
+        env:
+          PROJECT: ${{ matrix.project }}
+          FRONTEND: ${{ matrix.frontend }}
+          SAMPLE: ${{ matrix.sample }}
+        shell: bash
+        run: |
+          cd "source/$FRONTEND"
+          OUT="$GITHUB_WORKSPACE/artifacts/$PROJECT"
+          echo "sample_file=$SAMPLE" >> "$OUT/environment.txt"
+          START=$(date +%s)
+          set +e
+          timeout --signal=TERM --kill-after=30s 600s \
+            ./node_modules/.bin/vitest run "$SAMPLE" \
+            --maxWorkers=2 --reporter=json --outputFile="$OUT/sample-run.json" \
+            > "$OUT/sample.log" 2>&1
+          RC=$?
+          set -e
+          END=$(date +%s)
+          printf 'exit_code=%s\nduration_seconds=%s\n' "$RC" "$((END-START))" \
+            > "$OUT/sample-status.txt"
+          echo "Sample run exit: $RC; duration: $((END-START)) s"
+          tail -n 35 "$OUT/sample.log" || true
+          exit "$RC"
+
+      - name: Upload complete pilot evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-pilot-${{ matrix.project }}
+          path: artifacts/${{ matrix.project }}/
+          if-no-files-found: warn
+          retention-days: 14
