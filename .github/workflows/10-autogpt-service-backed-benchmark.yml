@@ -1,0 +1,338 @@
+name: AutoGPT Service-backed Execution Benchmark (Step 10)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci_copilot
+      DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci_copilot
+      DATABASE_NAME: ci_copilot
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_VHOST: ci-copilot
+      REDIS_HOST: localhost
+      REDIS_PORT: '17000'
+      TRIAL_TEST_DATABASE: '1'
+      CI: 'true'
+      PLAIN_OUTPUT: 'True'
+      EXECUTION_MANAGER_PORT: '18002'
+      DATABASE_API_PORT: '18005'
+      AGENT_API_PORT: '18006'
+      EXECUTION_SCHEDULER_PORT: '18003'
+      NOTIFICATION_SERVICE_PORT: '18007'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+      SKILLS_CATALOG_PATH: ${{ github.workspace }}/skills-catalog
+    services:
+      rabbitmq:
+        image: rabbitmq:4.1.4
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+      falkordb:
+        image: falkordb/falkordb:v4.18.9
+        env:
+          REDIS_ARGS: "--requirepass local-dev-password"
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli -a local-dev-password ping || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      clamav:
+        image: clamav/clamav-debian:latest
+        env:
+          CLAMAV_NO_FRESHCLAMD: 'false'
+        ports:
+          - 3310:3310
+        options: >-
+          --health-cmd "clamdscan --version || exit 1"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 8
+          --health-start-period 180s
+
+    steps:
+      - name: Checkout researcher repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Checkout exact AutoGPT commit
+        uses: actions/checkout@v4
+        with:
+          repository: Significant-Gravitas/AutoGPT
+          ref: 39856ae4533ce7025647dfc6e899a1c56f1324e5
+          path: source
+          persist-credentials: false
+      - name: Checkout skills catalog (needed by upstream CI)
+        uses: actions/checkout@v4
+        with:
+          repository: Significant-Gravitas/skills-catalog
+          path: skills-catalog
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify SHA and initialise diagnostic folder
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = '39856ae4533ce7025647dfc6e899a1c56f1324e5'
+          {
+            echo "commit=$actual"
+            date -u '+utc=%FT%TZ'
+            python --version
+            nproc
+            free -h
+          } > diagnostics/environment.txt
+      - name: Start PostgreSQL and three-node Redis cluster
+        shell: bash
+        working-directory: source/autogpt_platform
+        run: |
+          set -euo pipefail
+          docker run -d --name postgres-test \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=postgres \
+            -p 5432:5432 \
+            -v "$(pwd)/db/init/00-init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro" \
+            pgvector/pgvector:pg15
+          ready=0
+          for i in $(seq 1 50); do
+            if docker exec postgres-test pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1 || { docker logs postgres-test; exit 1; }
+          docker exec postgres-test createdb -h 127.0.0.1 -U postgres "$DATABASE_NAME"
+          docker exec postgres-test psql -h 127.0.0.1 -U postgres -d "$DATABASE_NAME" \
+            -v ON_ERROR_STOP=1 -f /docker-entrypoint-initdb.d/00-init.sql
+          docker network create redis-cluster-ci
+          for i in 0 1 2; do
+            port=$((17000+i)); bus=$((27000+i)); name="redis-ci-$i"
+            docker run -d --name "$name" --network redis-cluster-ci --network-alias "$name" \
+              -p "$port:$port" redis:7 \
+              redis-server --port "$port" --cluster-enabled yes \
+              --cluster-config-file nodes.conf --cluster-node-timeout 5000 \
+              --cluster-require-full-coverage no --cluster-announce-hostname "$name" \
+              --cluster-announce-port "$port" --cluster-announce-bus-port "$bus" \
+              --cluster-preferred-endpoint-type hostname
+          done
+          for i in 0 1 2; do
+            port=$((17000+i)); name="redis-ci-$i"; ready=0
+            for j in $(seq 1 30); do
+              if docker exec "$name" redis-cli -p "$port" ping 2>/dev/null | grep -q '^PONG$'; then ready=1; break; fi
+              sleep 2
+            done
+            test "$ready" = 1 || { docker logs "$name"; exit 1; }
+          done
+          docker run --rm --network redis-cluster-ci redis:7 redis-cli --cluster create \
+            redis-ci-0:17000 redis-ci-1:17001 redis-ci-2:17002 \
+            --cluster-replicas 0 --cluster-yes
+          ready=0
+          for i in $(seq 1 30); do
+            if docker exec redis-ci-0 redis-cli -p 17000 cluster info | grep -q 'cluster_state:ok'; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1 || { docker exec redis-ci-0 redis-cli -p 17000 cluster info; exit 1; }
+          docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl add_vhost "$RABBITMQ_VHOST"
+          docker exec "${{ job.services.rabbitmq.id }}" rabbitmqctl set_permissions \
+            -p "$RABBITMQ_VHOST" guest '.*' '.*' '.*'
+      - name: Install dependencies and generate Prisma client
+        shell: bash
+        working-directory: source/autogpt_platform/backend
+        run: |
+          set -euo pipefail
+          python -m pip install 'poetry==2.2.1' > "$GITHUB_WORKSPACE/diagnostics/install-tools.log" 2>&1
+          poetry install --no-interaction --with dev > "$GITHUB_WORKSPACE/diagnostics/install-dependencies.log" 2>&1
+          poetry run prisma generate > "$GITHUB_WORKSPACE/diagnostics/prisma-generate.log" 2>&1
+          poetry run gen-prisma-stub > "$GITHUB_WORKSPACE/diagnostics/prisma-stub.log" 2>&1
+          poetry run prisma migrate deploy > "$GITHUB_WORKSPACE/diagnostics/prisma-migrate.log" 2>&1
+      - name: Generate ephemeral test keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(openssl rand -base64 32 | tr '+/' '-_')"
+          echo "::add-mask::$key"
+          echo "ENCRYPTION_KEY=$key" >> "$GITHUB_ENV"
+          secret="$(openssl rand -base64 32 | tr '+/' '-_')"
+          echo "::add-mask::$secret"
+          echo "UNSUBSCRIBE_SECRET_KEY=$secret" >> "$GITHUB_ENV"
+      - name: Record project and service configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo 'experiment=autogpt-python-service-backed-benchmark'
+            echo 'execution_configuration=github-actions/ubuntu-24.04/python3.12/poetry/dependencies-with-dev/postgres/redis/rabbitmq/falkordb/clamav'
+            echo 'test_scope=3-selected-tests-not-complete-suite'
+            echo 'repetitions=2-per-setting'
+            echo "runner_image=${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            docker ps --format 'docker={{.Names}} {{.Status}}'
+            poetry --version || true
+          } >> diagnostics/environment.txt
+      - name: Install pytest outcome reporter
+        shell: bash
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/benchmark_tooling"
+          cat > "${GITHUB_WORKSPACE}/benchmark_tooling/research_outcomes.py" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def pytest_runtest_logreport(report):
+              path = os.environ.get('BENCHMARK_REPORT_FILE')
+              if not path:
+                  return
+              record = dict(
+                  test_id=report.nodeid,
+                  phase=report.when,
+                  outcome=report.outcome,
+                  duration_s=round(report.duration, 6),
+                  wasxfail=bool(getattr(report, 'wasxfail', False)),
+              )
+              if report.failed:
+                  record['error'] = str(report.longrepr)[:20000]
+              with Path(path).open('a', encoding='utf-8') as stream:
+                  stream.write(json.dumps(record, ensure_ascii=False) + '\n')
+          PY
+      - name: Repeat isolation and 3-test subset with full services
+        id: benchmark
+        continue-on-error: true
+        shell: bash
+        working-directory: source/autogpt_platform/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/benchmark_tooling
+          BENCHMARK_OUTPUT_DIR: ${{ github.workspace }}/diagnostics
+        run: |
+          cat > "$GITHUB_WORKSPACE/benchmark_tooling/repeat_benchmark.py" <<'PY'
+          import csv
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          from collections import Counter
+          from pathlib import Path
+
+          root = Path(os.environ['BENCHMARK_OUTPUT_DIR'])
+          root.mkdir(exist_ok=True, parents=True)
+          tests = [
+              'backend/copilot/executor/utils_test.py::TestCoPilotExecutionEntry::test_basic_fields',
+              'backend/copilot/executor/utils_test.py::TestCoPilotExecutionEntry::test_optional_fields',
+              'backend/copilot/executor/utils_test.py::TestCancelCoPilotEvent::test_serialization',
+          ]
+          for test in tests:
+              if not Path(test.split('::')[0]).is_file():
+                  raise RuntimeError('Test file not found: ' + test)
+          (root / 'selected-tests.json').write_text(json.dumps(tests, indent=2))
+          outcomes = []
+          invocations = []
+          phases_all = root / 'all-report-phases.jsonl'
+          for setting in ('isolation', 'suite_subset'):
+              for run in (1, 2):
+                  selections = [[t] for t in tests] if setting == 'isolation' else [tests]
+                  for idx, selected in enumerate(selections, start=1):
+                      name = f'{setting}-run{run}-group{idx}'
+                      phase_file = root / f'{name}-phases.jsonl'
+                      logfile = root / f'{name}.log'
+                      env = dict(os.environ, BENCHMARK_REPORT_FILE=str(phase_file))
+                      command = ['poetry', 'run', 'python', '-m', 'pytest', '-q', '-vv',
+                                 '--tb=long', '-p', 'research_outcomes', '-p', 'no:cacheprovider'] + selected
+                      begun = time.monotonic()
+                      timed_out = False
+                      with logfile.open('w', encoding='utf-8') as f:
+                          f.write('SELECTED_TEST_COUNT=' + str(len(selected)) + '\n')
+                          f.flush()
+                          try:
+                              process = subprocess.run(command, env=env, stdout=f,
+                                  stderr=subprocess.STDOUT, timeout=180, check=False)
+                              exit_code = process.returncode
+                          except subprocess.TimeoutExpired:
+                              exit_code = 124
+                              timed_out = True
+                              f.write('\nBENCHMARK TIMEOUT 180 seconds\n')
+                      elapsed = round(time.monotonic() - begun, 3)
+                      phases = []
+                      if phase_file.exists():
+                          for line in phase_file.read_text(encoding='utf-8').splitlines():
+                              try:
+                                  phases.append(json.loads(line))
+                              except json.JSONDecodeError:
+                                  continue
+                          with phases_all.open('a', encoding='utf-8') as out:
+                              for record in phases:
+                                  out.write(json.dumps(dict(record, setting=setting, run=run,
+                                                            group=idx, invocation=name)) + '\n')
+                      invocations.append(dict(setting=setting, run=run, group=idx,
+                                             selected_count=len(selected), wall_seconds=elapsed,
+                                             exit_code=exit_code, timed_out=timed_out,
+                                             log_file=logfile.name))
+                      for test in selected:
+                          records = [p for p in phases if p['test_id'] == test]
+                          if timed_out:
+                              result = 'N'
+                          elif not records:
+                              result = 'N'
+                          elif any(p['outcome'] == 'failed' for p in records):
+                              result = '0'
+                          elif any(p['outcome'] == 'skipped' for p in records):
+                              result = 'S'
+                          elif any(p['phase'] == 'call' and p['outcome'] == 'passed' for p in records) and any(
+                              p['phase'] == 'teardown' and p['outcome'] == 'passed' for p in records):
+                              result = '1'
+                          else:
+                              result = 'N'
+                          outcomes.append(dict(setting=setting, run=run, test_id=test,
+                              outcome=result, test_phase_seconds=round(sum(p['duration_s'] for p in records), 3),
+                              invocation_wall_seconds=elapsed, invocation=name,
+                              timed_out=timed_out, exit_code=exit_code))
+                      print(f'{name}: {elapsed}s, exit_code={exit_code}, timeout={timed_out}', flush=True)
+
+          for filename, rows, cols in [
+              ('outcomes.csv', outcomes, ['setting','run','test_id','outcome','test_phase_seconds',
+                                         'invocation_wall_seconds','invocation','timed_out','exit_code']),
+              ('invocations.csv', invocations, ['setting','run','group','selected_count',
+                                                'wall_seconds','exit_code','timed_out','log_file'])]:
+              with (root/filename).open('w', newline='', encoding='utf-8') as file:
+                  writer = csv.DictWriter(file, fieldnames=cols)
+                  writer.writeheader()
+                  writer.writerows(rows)
+          count = Counter(row['outcome'] for row in outcomes)
+          summary = dict(num_selected_tests=len(tests), isolation_invocations=6,
+                         suite_subset_invocations=2, total_outcomes=len(outcomes),
+                         outcomes=dict(count), every_invocation_completed=all(
+                             x['exit_code'] in (0, 1) and not x['timed_out'] for x in invocations))
+          (root/'summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          if any(row['outcome'] == 'N' for row in outcomes):
+              print('WARNING: one or more outcomes unobserved; inspect logs', file=sys.stderr)
+              raise SystemExit(1)
+          # A test failure is legitimate 0 data, not an infrastructure failure.
+          # The benchmark should exit successfully even if a test fails.
+          raise SystemExit(0)
+          PY
+          poetry run python "$GITHUB_WORKSPACE/benchmark_tooling/repeat_benchmark.py"
+      - name: Upload complete benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autogpt-service-backed-repeat-benchmark
+          path: diagnostics/
+          retention-days: 14
+          if-no-files-found: warn
