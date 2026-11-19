@@ -98,8 +98,19 @@ jobs:
               }
               if report.failed:
                   entry['error'] = str(report.longrepr)
-              with (ROOT / 'phase-reports.jsonl').open('a', encoding='utf-8') as file:
-                  file.write(json.dumps(entry, ensure_ascii=False) + '\n')
+              
+                  payload = (json.dumps(entry, ensure_ascii=False) + '\n').encode('utf-8')
+                  
+                  fd = os.open(
+                      str(ROOT / 'phase-reports.jsonl'),
+                      os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                      0o600,
+                  )
+                  try:
+                      os.write(fd, payload)
+                  finally:
+                      os.close(fd)
+
           PY
 
           cat > research_tools/run_complete_suite.py <<'PY'
