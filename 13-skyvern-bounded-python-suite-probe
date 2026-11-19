@@ -1,0 +1,196 @@
+name: Skyvern Bounded Full Python Suite Probe (Step 13)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  skyvern-suite-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CI: 'true'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      PYTHONPATH: ${{ github.workspace }}/research_tools
+      RESEARCH_OUTPUT: ${{ github.workspace }}/probe_results
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+    steps:
+      - name: Checkout exact Skyvern commit
+        uses: actions/checkout@v4
+        with:
+          repository: Skyvern-AI/skyvern
+          ref: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+          path: source
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify commit and document environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESEARCH_OUTPUT" research_tools
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_SHA"
+          {
+            echo "project=Skyvern"
+            echo "sha=$actual"
+            echo "utc_start=$(date -u +%FT%TZ)"
+            python --version
+            nproc
+            free -h
+            uname -a
+            echo "scope=Python pytest default collection at pinned commit"
+            echo "note=Time-limited probe only; incomplete outcome N is not failure"
+          } > "$RESEARCH_OUTPUT/environment.txt"
+      - name: Install pinned Python dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'uv==0.13.9' > "$RESEARCH_OUTPUT/install-uv.log" 2>&1
+          timeout 900s uv sync --locked --extra server --group dev --python "$(command -v python)" \
+            > "$RESEARCH_OUTPUT/install-dependencies.log" 2>&1
+          uv --version >> "$RESEARCH_OUTPUT/environment.txt"
+          uv run --no-sync python -m pytest --version >> "$RESEARCH_OUTPUT/environment.txt" 2>&1
+      - name: Write per-phase pytest recorder and bounded runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research_tools/skyvern_research_plugin.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          
+          root = Path(os.environ['RESEARCH_OUTPUT'])
+          def pytest_collection_finish(session):
+              with (root / 'collected-nodeids.jsonl').open('w', encoding='utf-8') as fh:
+                  for item in session.items:
+                      fh.write(json.dumps(item.nodeid, ensure_ascii=False) + '\n')
+              (root / 'collection-count.txt').write_text(str(len(session.items)), encoding='utf-8')
+          
+          def pytest_runtest_logreport(report):
+              data = {
+                  'test_id': report.nodeid,
+                  'phase': report.when,
+                  'outcome': report.outcome,
+                  'duration_seconds': report.duration,
+                  'expected_failure': bool(getattr(report, 'wasxfail', False)),
+              }
+              if report.failed:
+                  data['error'] = str(report.longrepr)[:30000]
+              with (root / 'phase-reports.jsonl').open('a', encoding='utf-8') as fh:
+                  fh.write(json.dumps(data, ensure_ascii=False) + '\n')
+          PY
+          cat > research_tools/skyvern_bounded_runner.py <<'PY'
+          import csv
+          import json
+          import os
+          import signal
+          import subprocess
+          import time
+          from collections import defaultdict, Counter
+          from pathlib import Path
+          
+          out = Path(os.environ['RESEARCH_OUTPUT'])
+          project_root = Path(os.environ['GITHUB_WORKSPACE']) / 'source'
+          cmd = ['uv', 'run', '--no-sync', 'python', '-m', 'pytest',
+                 '-p', 'skyvern_research_plugin', '-q', '--tb=short', '-r', 'fEsx']
+          timeout_seconds = 720
+          start = time.monotonic()
+          timed_out = False
+          (out / 'execution-command.txt').write_text(repr(cmd) + '\n', encoding='utf-8')
+          with (out / 'full-suite-pytest.log').open('w', encoding='utf-8') as log:
+              proc = subprocess.Popen(cmd, cwd=project_root, env=dict(os.environ),
+                                      stdout=log, stderr=subprocess.STDOUT,
+                                      start_new_session=True)
+              try:
+                  exit_code = proc.wait(timeout=timeout_seconds)
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  os.killpg(proc.pid, signal.SIGINT)
+                  try:
+                      exit_code = proc.wait(timeout=12)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(proc.pid, signal.SIGTERM)
+                      try:
+                          exit_code = proc.wait(timeout=6)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(proc.pid, signal.SIGKILL)
+                          exit_code = proc.wait()
+                  log.write('\nRESEARCH_TIME_BUDGET_EXCEEDED; full suite NOT completed.\n')
+          elapsed = round(time.monotonic() - start, 3)
+          
+          raw_nodeids = out / 'collected-nodeids.jsonl'
+          raw_reports = out / 'phase-reports.jsonl'
+          ids = []
+          if raw_nodeids.exists():
+              for line in raw_nodeids.read_text(encoding='utf-8').splitlines():
+                  try: ids.append(json.loads(line))
+                  except json.JSONDecodeError: pass
+          reports = defaultdict(list)
+          if raw_reports.exists():
+              for line in raw_reports.read_text(encoding='utf-8').splitlines():
+                  try:
+                      r = json.loads(line)
+                      reports[r['test_id']].append(r)
+                  except (ValueError, KeyError): pass
+          
+          def classify(phases):
+              if any(r['outcome'] == 'failed' for r in phases):
+                  return '0'
+              if any(r['outcome'] == 'skipped' for r in phases):
+                  return 'S'
+              if (any(r['phase'] == 'call' and r['outcome'] == 'passed' for r in phases)
+                  and any(r['phase'] == 'teardown' and r['outcome'] == 'passed' for r in phases)):
+                  return '1'
+              return 'N'
+          counts = Counter()
+          with (out / 'partial-outcomes.csv').open('w', newline='', encoding='utf-8') as fh:
+              writer = csv.writer(fh)
+              writer.writerow(['test_id', 'outcome', 'setting', 'run', 'sha'])
+              for tid in ids:
+                  status = classify(reports.get(tid, []))
+                  counts[status] += 1
+                  writer.writerow([tid, status, 'full-suite-bounded-probe', 1,
+                                   os.environ['EXPECTED_SHA']])
+          complete = (not timed_out and exit_code in (0, 1)
+                      and len(ids) > 0 and counts['N'] == 0)
+          summary = {
+              'project': 'Skyvern Python pytest',
+              'sha': os.environ['EXPECTED_SHA'],
+              'setting': 'bounded full-suite probe (not a 5000-run experiment)',
+              'timeout_seconds': timeout_seconds,
+              'wall_seconds': elapsed,
+              'timed_out': timed_out,
+              'pytest_exit_code': exit_code,
+              'collected_count': len(ids),
+              'terminal_reports_for_count': len(reports),
+              'outcomes': {c: counts[c] for c in ['1','0','S','N']},
+              'complete_suite_run': complete,
+              'interpretation': ('Full suite completed only if complete_suite_run true. '
+                                 'Pass and fail in separate repeated runs required for flakiness. '
+                                 'Missing executions are N, not failures.'),
+          }
+          (out / 'probe-summary.json').write_text(json.dumps(summary, indent=2),
+                                                   encoding='utf-8')
+          print('SKYVERN BOUNDED SUITE PROBE', json.dumps(summary, indent=2), flush=True)
+          PY
+      - name: Run bounded Skyvern full-suite probe (12 minutes maximum)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python research_tools/skyvern_bounded_runner.py
+      - name: Upload results and complete diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-bounded-python-suite-step13
+          path: probe_results/
+          retention-days: 14
+          if-no-files-found: warn
