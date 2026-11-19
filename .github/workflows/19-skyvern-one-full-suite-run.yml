@@ -1,0 +1,480 @@
+
+name: Skyvern One Complete Python Suite Run (Step 19)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite_run_number:
+        description: 'Full-suite run number, starting at 1'
+        type: number
+        required: true
+        default: 1
+      execution_limit_minutes:
+        description: 'Full-suite execution cap, 30-210 min (not total job time)'
+        type: number
+        required: true
+        default: 180
+
+permissions:
+  contents: read
+
+jobs:
+  full-suite-one-run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+      RESEARCH_OUTPUT: ${{ github.workspace }}/suite_results
+      PYTHONPATH: ${{ github.workspace }}/research_tools
+      SUITE_RUN_NUMBER: ${{ inputs.suite_run_number }}
+      EXECUTION_LIMIT_MINUTES: ${{ inputs.execution_limit_minutes }}
+      CI: 'true'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+
+    steps:
+      - name: Checkout Skyvern at specified commit
+        uses: actions/checkout@v4
+        with:
+          repository: Skyvern-AI/skyvern
+          ref: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+          path: source
+          persist-credentials: false
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify SHA and document machine
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+          mkdir -p "$RESEARCH_OUTPUT" research_tools
+          {
+            date -u '+utc_start=%FT%TZ'
+            python --version
+            uname -a
+            nproc
+            free -h
+            echo "runner_image_version=${ImageVersion:-unknown}"
+          } > "$RESEARCH_OUTPUT/environment.txt"
+
+      - name: Install locked dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'uv==0.13.9' > "$RESEARCH_OUTPUT/install-uv.log" 2>&1
+          timeout 900s uv sync --locked --extra server --group dev --python "$(command -v python)" > "$RESEARCH_OUTPUT/install-dependencies.log" 2>&1
+          uv --version > "$RESEARCH_OUTPUT/tools.txt"
+          uv run --no-sync python -m pytest --version >> "$RESEARCH_OUTPUT/tools.txt" 2>&1
+
+      - name: Create streaming recorder and runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research_tools/research_full_suite_recorder.py <<'PY'
+          """Persist pytest's complete per-phase results as a streaming journal."""
+          import json
+          import os
+          from pathlib import Path
+
+          ROOT = Path(os.environ['RESEARCH_OUTPUT'])
+
+          def pytest_collection_finish(session):
+              with (ROOT / 'collected-nodeids.jsonl').open('w', encoding='utf-8') as file:
+                  for item in session.items:
+                      file.write(json.dumps(item.nodeid, ensure_ascii=False) + '\n')
+
+          def pytest_runtest_logreport(report):
+              entry = {
+                  'nodeid': report.nodeid,
+                  'phase': report.when,
+                  'outcome': report.outcome,
+                  'duration_seconds': round(report.duration, 6),
+                  'expected_failure': bool(getattr(report, 'wasxfail', False)),
+              }
+              if report.failed:
+                  entry['error'] = str(report.longrepr)
+              with (ROOT / 'phase-reports.jsonl').open('a', encoding='utf-8') as file:
+                  file.write(json.dumps(entry, ensure_ascii=False) + '\n')
+          PY
+
+          cat > research_tools/run_complete_suite.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import platform
+          import signal
+          import subprocess
+          import time
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          out = Path(os.environ['RESEARCH_OUTPUT'])
+          source = root / 'source'
+          expected_sha = os.environ['EXPECTED_SHA']
+          run_number = int(os.environ['SUITE_RUN_NUMBER'])
+          limit_minutes = int(os.environ['EXECUTION_LIMIT_MINUTES'])
+
+          if not 1 <= run_number <= 5000 or not 30 <= limit_minutes <= 210:
+              raise ValueError('Invalid execution parameters')
+
+          def utc_now():
+              return datetime.now(timezone.utc).isoformat()
+
+          def read_jsonl(file):
+              if not file.exists():
+                  return []
+              items = []
+              with file.open(encoding='utf-8') as handle:
+                  for line in handle:
+                      if not line.strip():
+                          continue
+                      try:
+                          items.append(json.loads(line))
+                      except json.JSONDecodeError:
+                          pass
+              return items
+
+          def canonical_prefix(nid):
+              return 'tests/' + nid if nid.startswith('unit/') else nid
+
+          start_utc = utc_now()
+          cmd = [
+              'uv', 'run', '--no-sync', 'python', '-m', 'pytest',
+              '-p', 'research_full_suite_recorder',
+              '-q', '--tb=long', '-ra'
+          ]
+
+          (out / 'execution-command.json').write_text(
+              json.dumps(cmd, indent=2)
+          )
+
+          env = dict(os.environ)
+
+          with (out / 'full-suite-pytest.log').open('w', encoding='utf-8') as log:
+              log.write(f'Started UTC: {start_utc}\nFull-suite command: {cmd!r}\n')
+              log.flush()
+
+              proc = subprocess.Popen(
+                  cmd,
+                  cwd=source,
+                  env=env,
+                  stdout=log,
+                  stderr=subprocess.STDOUT,
+                  start_new_session=True
+              )
+
+              start = time.monotonic()
+              timed_out = False
+
+              try:
+                  exit_code = proc.wait(timeout=limit_minutes * 60)
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  os.killpg(proc.pid, signal.SIGINT)
+                  try:
+                      exit_code = proc.wait(timeout=12)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(proc.pid, signal.SIGTERM)
+                      try:
+                          exit_code = proc.wait(timeout=8)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(proc.pid, signal.SIGKILL)
+                          exit_code = proc.wait()
+
+                  log.write(
+                      '\nRESEARCH_EXECUTION_LIMIT_REACHED; full suite did not finish.\n'
+                  )
+
+              wall_seconds = round(time.monotonic() - start, 3)
+              log.flush()
+
+          raw_ids = read_jsonl(out / 'collected-nodeids.jsonl')
+          phases_by_id = defaultdict(list)
+
+          for report in read_jsonl(out / 'phase-reports.jsonl'):
+              if isinstance(report, dict) and 'nodeid' in report:
+                  phases_by_id[report['nodeid']].append(report)
+
+          normalized = [canonical_prefix(nid) for nid in raw_ids]
+
+          nonce_prefix = (
+              'tests/unit/browser_extension/test_relay.py::'
+              'test_client_nonce_must_be_unpadded_base64url_for_exactly_32_bytes['
+          )
+
+          fixed = {
+              nonce_prefix + val + ']'
+              for val in (
+                  'short',
+                  '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!',
+                  'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB'
+              )
+          }
+
+          dynamic_positions = [
+              i for i, val in enumerate(normalized)
+              if val.startswith(nonce_prefix) and val not in fixed
+          ]
+
+          dynamic_set = set(dynamic_positions)
+          stable = sorted(
+              val for i, val in enumerate(normalized)
+              if i not in dynamic_set
+          )
+
+          stable_sha = hashlib.sha256(
+              json.dumps(stable, ensure_ascii=False).encode()
+          ).hexdigest()
+
+          expected_stable_sha = (
+              'ceaf5226500a321838b802cac833522347f54e483911b7f490cf62243ca211fa'
+          )
+
+          stable_inventory_verified = (
+              len(normalized) == 35776
+              and len(set(normalized)) == 35776
+              and len(dynamic_positions) == 3
+              and len(stable) == 35773
+              and stable_sha == expected_stable_sha
+          )
+
+          config = {
+              'project': 'Skyvern Python pytest',
+              'source_commit': expected_sha,
+              'uv_lock_sha256': hashlib.sha256(
+                  (source / 'uv.lock').read_bytes()
+              ).hexdigest(),
+              'setting': 'full_suite',
+              'suite_run_number': run_number,
+              'runner_image_version': os.environ.get('ImageVersion', 'unknown'),
+              'python_version': platform.python_version(),
+              'platform': platform.platform(),
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'github_run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'pytest_command': cmd,
+              'test_order': 'pytest default collection / execution order; no sharding',
+              'execution_limit_minutes': limit_minutes,
+              'start_utc': start_utc,
+              'end_utc': utc_now(),
+              'wall_seconds': wall_seconds,
+              'stable_inventory_sha256': stable_sha,
+              'inventory_verified': stable_inventory_verified,
+              'dynamic_parameter_nodeids': len(dynamic_positions),
+              'note': (
+                  'Randomly generated parameters vary between collections; '
+                  'canonical slots are NOT identical input data.'
+              )
+          }
+
+          comparison = {
+              k: v for k, v in config.items()
+              if k not in (
+                  'suite_run_number',
+                  'github_run_id',
+                  'github_run_attempt',
+                  'start_utc',
+                  'end_utc',
+                  'wall_seconds'
+              )
+          }
+
+          config['config_sha256'] = hashlib.sha256(
+              json.dumps(comparison, sort_keys=True).encode()
+          ).hexdigest()
+
+          (out / 'run-config.json').write_text(
+              json.dumps(config, indent=2)
+          )
+
+          dynamic_slot_map = {
+              position: i + 1
+              for i, position in enumerate(dynamic_positions)
+          }
+
+          rows = []
+
+          for i, (raw, nid) in enumerate(zip(raw_ids, normalized)):
+              canonical = (
+                  nonce_prefix + f'generated-param-slot-{dynamic_slot_map[i]}]'
+                  if i in dynamic_set else nid
+              )
+
+              reports = phases_by_id.get(raw, [])
+
+              if any(r['outcome'] == 'failed' for r in reports):
+                  outcome = '0'
+              elif any(r['outcome'] == 'skipped' for r in reports):
+                  outcome = 'S'
+              elif all(
+                  any(
+                      r.get('phase') == phase
+                      and r.get('outcome') == 'passed'
+                      for r in reports
+                  )
+                  for phase in ('setup', 'call', 'teardown')
+              ):
+                  outcome = '1'
+              else:
+                  outcome = 'N'
+
+              if outcome == '0':
+                  error_types = sorted({
+                      r['phase'] for r in reports
+                      if r['outcome'] == 'failed'
+                  })
+              else:
+                  error_types = []
+
+              rows.append({
+                  'test_id': canonical,
+                  'actual_pytest_nodeid': raw,
+                  'test_name': canonical.split('::')[-1],
+                  'module': canonical.split('::')[0],
+                  'sha': expected_sha,
+                  'setting': 'full_suite',
+                  'run_number': run_number,
+                  'outcome': outcome,
+                  'failure_phases': ';'.join(error_types),
+                  'collection_index': i,
+                  'config_sha256': config['config_sha256']
+              })
+
+          counts = Counter(row['outcome'] for row in rows)
+
+          with (out / 'outcomes-long.csv').open(
+              'w', newline='', encoding='utf-8'
+          ) as fh:
+              fieldnames = [
+                  'test_id', 'actual_pytest_nodeid', 'test_name',
+                  'module', 'sha', 'setting', 'run_number', 'outcome',
+                  'failure_phases', 'collection_index', 'config_sha256'
+              ]
+              writer = csv.DictWriter(fh, fieldnames=fieldnames)
+              writer.writeheader()
+              writer.writerows(rows)
+
+          with (out / 'partial-wide.csv').open(
+              'w', newline='', encoding='utf-8'
+          ) as fh:
+              writer = csv.writer(fh)
+              writer.writerow([
+                  'test_id', 'test_name', 'module', 'sha',
+                  f'run_{run_number}'
+              ])
+              for row in rows:
+                  writer.writerow([
+                      row['test_id'],
+                      row['test_name'],
+                      row['module'],
+                      row['sha'],
+                      row['outcome']
+                  ])
+
+          with (out / 'failure-summary.csv').open(
+              'w', newline='', encoding='utf-8'
+          ) as fh:
+              writer = csv.writer(fh)
+              writer.writerow([
+                  'test_name',
+                  'fail_runs_count',
+                  'first_failing_run',
+                  'all_failing_runs'
+              ])
+              for row in rows:
+                  failed = row['outcome'] == '0'
+                  writer.writerow([
+                      row['test_id'],
+                      int(failed),
+                      run_number if failed else '',
+                      str(run_number) if failed else ''
+                  ])
+
+          complete = (
+              not timed_out
+              and exit_code in (0, 1)
+              and stable_inventory_verified
+              and counts['N'] == 0
+              and len(rows) == 35776
+          )
+
+          summary = {
+              'project': 'Skyvern Python pytest',
+              'sha': expected_sha,
+              'setting': 'full_suite',
+              'suite_run_number': run_number,
+              'collected_count': len(raw_ids),
+              'stable_inventory_verified': stable_inventory_verified,
+              'stable_inventory_sha256': stable_sha,
+              'outcomes': {
+                  key: counts[key] for key in ('1', '0', 'S', 'N')
+              },
+              'pytest_exit_code': exit_code,
+              'timed_out': timed_out,
+              'wall_seconds': wall_seconds,
+              'complete_suite_run': complete,
+              'runner_image_version': config['runner_image_version'],
+              'config_sha256': config['config_sha256'],
+              'warning': (
+                  'One suite repetition only, not a 5000-repetition experiment; '
+                  'do not classify flaky from one run.'
+              )
+          }
+
+          (out / 'suite-summary.json').write_text(
+              json.dumps(summary, indent=2)
+          )
+
+          with open(
+              os.environ['GITHUB_STEP_SUMMARY'],
+              'a',
+              encoding='utf-8'
+          ) as f:
+              f.write('## Skyvern Full-Suite Run — Step 19\n\n')
+              f.write(f'- Complete full-suite run: **{complete}**\n')
+              f.write(
+                  f'- Collected: {len(raw_ids)}; '
+                  f'Pass: {counts["1"]}; '
+                  f'Fail: {counts["0"]}; '
+                  f'Skip: {counts["S"]}; '
+                  f'Missing: {counts["N"]}\n'
+              )
+              f.write(
+                  f'- Timed out: {timed_out}; '
+                  f'pytest exit code: {exit_code}\n'
+              )
+              f.write(
+                  f'- Commit: `{expected_sha}`; '
+                  f'Runner image: `{config["runner_image_version"]}`\n'
+              )
+
+          print(json.dumps(summary, indent=2), flush=True)
+
+          if not complete:
+              print(
+                  '::warning::Suite run is incomplete; do not count it as '
+                  'one of the 5000 complete suite repetitions.',
+                  flush=True
+              )
+          PY
+
+      - name: Run the full suite once with per-test outcome journal
+        shell: bash
+        run: |
+          python research_tools/run_complete_suite.py
+
+      - name: Upload suite execution results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-full-suite-step19-${{ github.run_id }}-${{ github.run_attempt }}
+          path: suite_results/
+          retention-days: 14
+          if-no-files-found: warn
