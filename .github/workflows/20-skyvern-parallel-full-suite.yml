@@ -1,0 +1,498 @@
+
+name: Skyvern Parallel Full-Suite Repetitions (Step 20)
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_run_number:
+        description: 'First new suite run number (use 3 for Run 3-10)'
+        type: number
+        required: true
+        default: 3
+      per_run_limit_minutes:
+        description: 'Time budget for each full suite (30-70 minutes)'
+        type: number
+        required: true
+        default: 65
+
+permissions:
+  contents: read
+
+jobs:
+  repeated-suite:
+    name: Shard ${{ matrix.shard }} - two full suites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
+
+    env:
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+      RESEARCH_ROOT: ${{ github.workspace }}/suite_results
+      PYTHONPATH: ${{ github.workspace }}/research_tools
+      FIRST_RUN_NUMBER: ${{ inputs.first_run_number }}
+      PER_RUN_LIMIT_MINUTES: ${{ inputs.per_run_limit_minutes }}
+      SHARD_NUMBER: ${{ matrix.shard }}
+      CI: 'true'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+
+    steps:
+      - name: Checkout exact Skyvern commit
+        uses: actions/checkout@v4
+        with:
+          repository: Skyvern-AI/skyvern
+          ref: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+          path: source
+          persist-credentials: false
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify source and install locked dependencies
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          mkdir -p "$RESEARCH_ROOT" "$GITHUB_WORKSPACE/research_tools"
+          python -m pip install 'uv==0.13.9'
+          timeout 900s uv sync --locked --extra server --group dev --python "$(command -v python)"
+          uv run --no-sync python -m pytest --version
+
+      - name: Create safe pytest recorder and full-suite runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research_tools/research_parallel_recorder.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          ROOT = Path(os.environ['RESEARCH_OUTPUT'])
+          RAW_OPEN, RAW_WRITE, RAW_CLOSE = os.open, os.write, os.close
+
+          def write_all(fd, payload):
+              view = memoryview(payload)
+              while view:
+                  count = RAW_WRITE(fd, view)
+                  if count <= 0:
+                      raise OSError('Recorder wrote zero bytes')
+                  view = view[count:]
+
+          def pytest_collection_finish(session):
+              fd = RAW_OPEN(str(ROOT / 'collected-nodeids.jsonl'),
+                            os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              try:
+                  for item in session.items:
+                      write_all(fd, (json.dumps(item.nodeid, ensure_ascii=False) + '\n').encode())
+              finally:
+                  RAW_CLOSE(fd)
+
+          def pytest_runtest_logreport(report):
+              record = {
+                  'nodeid': report.nodeid,
+                  'phase': report.when,
+                  'outcome': report.outcome,
+                  'duration_seconds': round(report.duration, 6),
+                  'wasxfail': bool(getattr(report, 'wasxfail', False)),
+              }
+              if report.failed:
+                  record['error'] = str(report.longrepr)
+              payload = (json.dumps(record, ensure_ascii=False) + '\n').encode()
+              fd = RAW_OPEN(str(ROOT / 'phase-reports.jsonl'),
+                            os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+              try:
+                  write_all(fd, payload)
+              finally:
+                  RAW_CLOSE(fd)
+          PY
+
+          cat > research_tools/run_suite.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import platform
+          import signal
+          import subprocess
+          import time
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          workspace = Path(os.environ['GITHUB_WORKSPACE'])
+          source = workspace / 'source'
+          slot = int(os.environ['SLOT'])
+          shard = int(os.environ['SHARD_NUMBER'])
+          first = int(os.environ['FIRST_RUN_NUMBER'])
+          limit = int(os.environ['PER_RUN_LIMIT_MINUTES'])
+          run_number = first + 2 * shard + slot
+
+          if slot not in (0, 1) or first < 3 or run_number > 5000 or not 30 <= limit <= 70:
+              raise ValueError('Invalid run selection or execution limit')
+
+          out = Path(os.environ['RESEARCH_ROOT']) / f'slot{slot}'
+          out.mkdir(parents=True, exist_ok=True)
+          env = dict(os.environ, RESEARCH_OUTPUT=str(out))
+
+          cmd = ['uv', 'run', '--no-sync', 'python', '-m', 'pytest',
+                 '-p', 'research_parallel_recorder', '-q', '--tb=long', '-ra']
+
+          started = datetime.now(timezone.utc).isoformat()
+          start = time.monotonic()
+          timed_out = False
+
+          with (out / 'full-suite-pytest.log').open('w', encoding='utf-8') as log:
+              log.write(f'Run {run_number} UTC {started}; command {cmd!r}\n')
+              log.flush()
+
+              proc = subprocess.Popen(
+                  cmd, cwd=source, env=env, stdout=log,
+                  stderr=subprocess.STDOUT, start_new_session=True
+              )
+
+              try:
+                  exit_code = proc.wait(timeout=limit * 60)
+              except subprocess.TimeoutExpired:
+                  timed_out = True
+                  os.killpg(proc.pid, signal.SIGINT)
+                  try:
+                      exit_code = proc.wait(timeout=12)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(proc.pid, signal.SIGTERM)
+                      try:
+                          exit_code = proc.wait(timeout=8)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(proc.pid, signal.SIGKILL)
+                          exit_code = proc.wait()
+                  log.write('\nRESEARCH_RUN_TIME_LIMIT_EXCEEDED\n')
+
+              elapsed = round(time.monotonic() - start, 3)
+
+          def read_jsonl(path):
+              values, errors = [], 0
+              if path.exists():
+                  with path.open(encoding='utf-8') as handle:
+                      for line in handle:
+                          if line.strip():
+                              try:
+                                  values.append(json.loads(line))
+                              except json.JSONDecodeError:
+                                  errors += 1
+              return values, errors
+
+          raw_ids, bad_ids = read_jsonl(out / 'collected-nodeids.jsonl')
+          phase_records, bad_reports = read_jsonl(out / 'phase-reports.jsonl')
+
+          phases_by_id = defaultdict(list)
+          for r in phase_records:
+              if isinstance(r, dict) and r.get('nodeid'):
+                  phases_by_id[r['nodeid']].append(r)
+              else:
+                  bad_reports += 1
+
+          normalized = [
+              'tests/' + n if n.startswith('unit/') else n
+              for n in raw_ids
+          ]
+
+          prefix = (
+              'tests/unit/browser_extension/test_relay.py::'
+              'test_client_nonce_must_be_unpadded_base64url_for_exactly_32_bytes['
+          )
+
+          fixed = {
+              prefix + p + ']' for p in (
+                  'short',
+                  '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!',
+                  'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB'
+              )
+          }
+
+          dynamic = [
+              i for i, n in enumerate(normalized)
+              if n.startswith(prefix) and n not in fixed
+          ]
+          dynamic_set = set(dynamic)
+
+          stable = sorted(
+              n for i, n in enumerate(normalized)
+              if i not in dynamic_set
+          )
+
+          stable_sha = hashlib.sha256(
+              json.dumps(stable, ensure_ascii=False).encode()
+          ).hexdigest()
+
+          stable_expected = (
+              'ceaf5226500a321838b802cac833522347f54e483911b7f490cf62243ca211fa'
+          )
+
+          inventory_ok = (
+              len(raw_ids) == 35776
+              and len(set(normalized)) == 35776
+              and len(dynamic) == 3
+              and len(stable) == 35773
+              and stable_sha == stable_expected
+          )
+
+          locksha = hashlib.sha256(
+              (source / 'uv.lock').read_bytes()
+          ).hexdigest()
+
+          config = {
+              'source_commit': os.environ['EXPECTED_SHA'],
+              'uv_lock_sha256': locksha,
+              'python_version': platform.python_version(),
+              'runner_image_version': os.environ.get('ImageVersion', 'unknown'),
+              'platform': platform.platform(),
+              'pytest_command': cmd,
+              'setting': 'full_suite',
+              'timeout_minutes': limit,
+              'test_order': 'pytest default',
+              'stable_inventory_sha256': stable_sha,
+          }
+
+          config_sha = hashlib.sha256(
+              json.dumps(config, sort_keys=True).encode()
+          ).hexdigest()
+
+          config.update({
+              'config_sha256': config_sha,
+              'run_number': run_number,
+              'shard': shard,
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'github_run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'started_utc': started,
+              'completed_utc': datetime.now(timezone.utc).isoformat(),
+              'inventory_verified': inventory_ok,
+              'dynamic_parameter_warning': (
+                  'Three generated values differ across collections; '
+                  'do not classify these slots as the same input.'
+              )
+          })
+
+          (out / 'run-config.json').write_text(
+              json.dumps(config, indent=2)
+          )
+
+          rows = []
+          dynamic_slots = {
+              pos: index + 1 for index, pos in enumerate(dynamic)
+          }
+
+          for index, (raw, nid) in enumerate(zip(raw_ids, normalized)):
+              dynamic_parameter = index in dynamic_set
+              canonical = (
+                  prefix + f'generated-param-slot-{dynamic_slots[index]}]'
+                  if dynamic_parameter else nid
+              )
+
+              phases = phases_by_id.get(raw, [])
+
+              if any(r['outcome'] == 'failed' for r in phases):
+                  value = '0'
+              elif any(r['outcome'] == 'skipped' for r in phases):
+                  value = 'S'
+              elif all(
+                  any(
+                      r.get('phase') == phase
+                      and r.get('outcome') == 'passed'
+                      for r in phases
+                  )
+                  for phase in ('setup', 'call', 'teardown')
+              ):
+                  value = '1'
+              else:
+                  value = 'N'
+
+              rows.append({
+                  'test_id': canonical,
+                  'actual_pytest_nodeid': raw,
+                  'test_name': canonical.split('::')[-1],
+                  'module': canonical.split('::')[0],
+                  'sha': os.environ['EXPECTED_SHA'],
+                  'run_number': run_number,
+                  'setting': 'full_suite',
+                  'outcome': value,
+                  'failure_phases': ';'.join(
+                      sorted({
+                          r['phase'] for r in phases
+                          if r['outcome'] == 'failed'
+                      })
+                  ),
+                  'wasxfail': any(r.get('wasxfail') for r in phases),
+                  'dynamic_parameter': dynamic_parameter,
+                  'collection_index': index,
+                  'config_sha256': config_sha,
+              })
+
+          counts = Counter(r['outcome'] for r in rows)
+
+          def write_csv(filename, fields, data):
+              with (out / filename).open(
+                  'w', newline='', encoding='utf-8'
+              ) as fh:
+                  writer = csv.DictWriter(fh, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(data)
+
+          if rows:
+              write_csv('outcomes-long.csv', list(rows[0]), rows)
+
+              wide = [{
+                  'test_id': r['test_id'],
+                  'test_name': r['test_name'],
+                  'module': r['module'],
+                  'sha': r['sha'],
+                  f'run_{run_number}': r['outcome']
+              } for r in rows]
+
+              write_csv('partial-wide.csv', list(wide[0]), wide)
+
+              failures = [{
+                  'test_name': r['test_id'],
+                  'fail_runs_count': int(r['outcome'] == '0'),
+                  'first_failing_run': run_number if r['outcome'] == '0' else '',
+                  'all_failing_runs': run_number if r['outcome'] == '0' else ''
+              } for r in rows]
+
+              write_csv(
+                  'failure-summary.csv',
+                  list(failures[0]),
+                  failures
+              )
+
+          complete = (
+              not timed_out
+              and exit_code in (0, 1)
+              and inventory_ok
+              and counts['N'] == 0
+              and len(rows) == 35776
+              and bad_ids == 0
+              and bad_reports == 0
+          )
+
+          summary = {
+              'run_number': run_number,
+              'shard': shard,
+              'complete_suite_run': complete,
+              'collected': len(raw_ids),
+              'passed': counts['1'],
+              'failed': counts['0'],
+              'skipped': counts['S'],
+              'missing': counts['N'],
+              'expected_failures_recorded': sum(
+                  r['wasxfail'] for r in rows
+              ),
+              'timed_out': timed_out,
+              'pytest_exit_code': exit_code,
+              'wall_seconds': elapsed,
+              'bad_jsonl_lines': bad_ids + bad_reports,
+              'inventory_verified': inventory_ok,
+              'config_sha256': config_sha,
+              'note': (
+                  'Only complete=True is one valid full-suite attempt; '
+                  'dynamic parameter slots are not comparable identical inputs.'
+              )
+          }
+
+          (out / 'suite-summary.json').write_text(
+              json.dumps(summary, indent=2)
+          )
+
+          print(json.dumps(summary, indent=2), flush=True)
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as fh:
+              fh.write(f'### Skyvern run {run_number}\n\n')
+              fh.write(
+                  f'- Complete: **{complete}**; '
+                  f'pass {counts["1"]}, fail {counts["0"]}, '
+                  f'skip {counts["S"]}, missing {counts["N"]}\n'
+              )
+              fh.write(
+                  f'- Elapsed: {elapsed}s; exit code {exit_code}; '
+                  f'runner {config["runner_image_version"]}\n\n'
+              )
+
+          if not complete:
+              print(
+                  f'::warning::Run {run_number} incomplete; '
+                  'preserve logs but do not count as a complete full-suite repetition.'
+              )
+          PY
+
+      - name: Smoke-test recorder against file-write monkeypatch
+        shell: bash
+        working-directory: source
+        env:
+          RESEARCH_OUTPUT: ${{ github.workspace }}/suite_results/smoke
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESEARCH_OUTPUT"
+
+          uv run --no-sync python -m pytest -p research_parallel_recorder -q --tb=short \
+            tests/unit/test_data_export_block.py::test_export_block_returns_clean_failure_when_writing_parquet_fails \
+            > "$RESEARCH_OUTPUT/smoke.log" 2>&1 || {
+              cat "$RESEARCH_OUTPUT/smoke.log"
+              exit 1
+            }
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          reports = [
+              json.loads(line)
+              for line in (
+                  Path(os.environ['RESEARCH_OUTPUT']) / 'phase-reports.jsonl'
+              ).read_text().splitlines()
+          ]
+
+          assert any(
+              x['phase'] == 'call' and x['outcome'] == 'passed'
+              for x in reports
+          )
+          assert any(
+              x['phase'] == 'teardown' and x['outcome'] == 'passed'
+              for x in reports
+          )
+
+          print('Recorder smoke test PASSED')
+          PY
+
+      - name: First full-suite repetition
+        env:
+          SLOT: '0'
+        run: python research_tools/run_suite.py
+
+      - name: Upload first run logs and CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-step20-shard${{ matrix.shard }}-slot0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: suite_results/slot0/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Second full-suite repetition
+        env:
+          SLOT: '1'
+        run: python research_tools/run_suite.py
+
+      - name: Upload second run logs and CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-step20-shard${{ matrix.shard }}-slot1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: suite_results/slot1/
+          retention-days: 14
+          if-no-files-found: warn
