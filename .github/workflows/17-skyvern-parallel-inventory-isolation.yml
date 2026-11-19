@@ -1,0 +1,330 @@
+name: Skyvern Parallel Inventory Isolation Batches (Step 17)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_index:
+        description: 'Zero-based first inventory test index. Step 16 already completed indices 0-4.'
+        type: number
+        required: true
+        default: 5
+      tests_per_shard:
+        description: 'Number of NEW test IDs per parallel shard (1-20)'
+        type: number
+        required: true
+        default: 20
+      first_run_number:
+        description: 'First repetition number for every selected test (1-5000)'
+        type: number
+        required: true
+        default: 1
+      repetitions_per_test:
+        description: 'Repetitions per test per shard; tests_per_shard * repetitions <= 20'
+        type: number
+        required: true
+        default: 1
+
+permissions:
+  contents: read
+
+jobs:
+  full-inventory-isolation-batch:
+    name: Isolation shard ${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    timeout-minutes: 85
+    env:
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+      RESEARCH_OUTPUT: ${{ github.workspace }}/results
+      PYTHONPATH: ${{ github.workspace }}/research_tools
+      CI: 'true'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      BASE_INDEX: ${{ inputs.base_index }}
+      SHARD: ${{ matrix.shard }}
+      TESTS_PER_BATCH: ${{ inputs.tests_per_shard }}
+      FIRST_RUN_NUMBER: ${{ inputs.first_run_number }}
+      REPETITIONS_PER_TEST: ${{ inputs.repetitions_per_test }}
+
+    steps:
+      - name: Checkout exact Skyvern commit
+        uses: actions/checkout@v4
+        with:
+          repository: Skyvern-AI/skyvern
+          ref: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+          path: source
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compute this shard's non-overlapping zero-based inventory range
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "START_INDEX=$(( BASE_INDEX + SHARD * TESTS_PER_BATCH ))" >> "$GITHUB_ENV"
+
+      - name: Verify pinned commit and pilot parameters
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESEARCH_OUTPUT" research_tools
+          test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+          python - <<'PY'
+          import os
+          start=int(os.environ['START_INDEX'])
+          n=int(os.environ['TESTS_PER_BATCH'])
+          first=int(os.environ['FIRST_RUN_NUMBER'])
+          reps=int(os.environ['REPETITIONS_PER_TEST'])
+          assert 0 <= start < 35776
+          assert 1 <= n <= 20 and start+n <= 35776
+          assert 1 <= first <= 5000 and 1 <= reps <= 10 and first+reps-1 <= 5000
+          assert n * reps <= 20, 'Limit to 20 individual invocations per shard'
+          print(f'Inventory rows {start}..{start+n-1}; per-test runs {first}..{first+reps-1}')
+          PY
+
+      - name: Install locked Skyvern Python dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'uv==0.13.9' > "$RESEARCH_OUTPUT/install-uv.log" 2>&1
+          timeout 900s uv sync --locked --extra server --group dev --python "$(command -v python)" \
+            > "$RESEARCH_OUTPUT/install-dependencies.log" 2>&1
+          uv --version > "$RESEARCH_OUTPUT/tools.txt"
+          uv run --no-sync python -m pytest --version >> "$RESEARCH_OUTPUT/tools.txt" 2>&1
+
+      - name: Install pytest recorder and full-inventory batch runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research_tools/research_inventory_observer.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def pytest_collection_finish(session):
+              target = Path(os.environ['RESEARCH_COLLECTED_FILE'])
+              with target.open('w', encoding='utf-8') as f:
+                  for item in session.items:
+                      f.write(json.dumps(item.nodeid, ensure_ascii=False) + '\n')
+
+          def pytest_runtest_logreport(report):
+              target = os.environ.get('RESEARCH_PHASE_FILE')
+              if not target:
+                  return
+              row = {
+                  'test_id': report.nodeid,
+                  'phase': report.when,
+                  'outcome': report.outcome,
+                  'duration_seconds': report.duration,
+                  'was_xfail': bool(getattr(report, 'wasxfail', False)),
+              }
+              if report.failed:
+                  row['error'] = str(report.longrepr)
+              with Path(target).open('a', encoding='utf-8') as f:
+                  f.write(json.dumps(row, ensure_ascii=False) + '\n')
+          PY
+          cat > research_tools/execute_inventory_batch.py <<'PY'
+          import csv, hashlib, json, os, platform, signal, subprocess, time
+          from collections import defaultdict, Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          base = Path(os.environ['GITHUB_WORKSPACE'])
+          source = base / 'source'
+          output = Path(os.environ['RESEARCH_OUTPUT'])
+          logs = output / 'logs'
+          logs.mkdir(parents=True, exist_ok=True)
+          sha = os.environ['EXPECTED_SHA']
+          start_index = int(os.environ['START_INDEX'])
+          count = int(os.environ['TESTS_PER_BATCH'])
+          first_run = int(os.environ['FIRST_RUN_NUMBER'])
+          repeats = int(os.environ['REPETITIONS_PER_TEST'])
+          timeout_seconds = 90
+
+          def read_jsonl(path):
+              if not path.exists(): return []
+              records = []
+              with path.open(encoding='utf-8') as f:
+                  for line in f:
+                      try: records.append(json.loads(line))
+                      except json.JSONDecodeError: pass
+              return records
+
+          def execute(cmd, cwd, env, logfile, timeout):
+              started = time.monotonic()
+              timed_out = False
+              with logfile.open('w', encoding='utf-8') as f:
+                  f.write('command=' + repr(cmd) + '\n')
+                  f.flush()
+                  process = subprocess.Popen(cmd, cwd=cwd, env=env,
+                      stdout=f, stderr=subprocess.STDOUT, start_new_session=True)
+                  try:
+                      return_code = process.wait(timeout=timeout)
+                  except subprocess.TimeoutExpired:
+                      timed_out = True
+                      os.killpg(process.pid, signal.SIGINT)
+                      try: return_code = process.wait(timeout=8)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(process.pid, signal.SIGTERM)
+                          try: return_code = process.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              os.killpg(process.pid, signal.SIGKILL)
+                              return_code = process.wait()
+                      f.write('RESEARCH_TIME_LIMIT_EXCEEDED; no terminal outcome\n')
+                  f.flush()
+              return return_code, timed_out, round(time.monotonic() - started, 3)
+
+          # Recollect the entire project every job; no dependency on earlier artifact download.
+          raw_inventory = output / 'full-inventory-nodeids.jsonl'
+          collect_env = dict(os.environ, RESEARCH_COLLECTED_FILE=str(raw_inventory))
+          collect_cmd = ['uv','run','--no-sync','python','-m','pytest',
+                         '-p','research_inventory_observer','--collect-only','-q']
+          rc, timeout, seconds = execute(collect_cmd, source, collect_env,
+                                         output/'collection.log', 600)
+          raw_ids = read_jsonl(raw_inventory)
+          if timeout or rc != 0 or len(raw_ids) != 35776 or len(set(raw_ids)) != len(raw_ids):
+              raise RuntimeError(f'Inventory mismatch: pytest rc={rc}, timeout={timeout}, '
+                                 f'count={len(raw_ids)}, unique={len(set(raw_ids))}; '
+                                 'see collection.log. No outcomes were attempted.')
+          inventory = sorted(raw_ids)
+          inventory_digest = hashlib.sha256(json.dumps(inventory,ensure_ascii=False).encode()).hexdigest()
+          (output/'inventory-metadata.json').write_text(json.dumps({
+              'source_sha': sha, 'unique_test_count':len(inventory),
+              'inventory_sha256':inventory_digest, 'collection_wall_seconds':seconds,
+              'selection_rule':'sorted pytest nodeids, zero-based indices',
+              'selected_range':[start_index,start_index+count-1]}, indent=2))
+          chosen = inventory[start_index:start_index+count]
+          with (output/'selected-tests.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f);w.writerow(['index','test_id','sha'])
+              for idx,tid in enumerate(chosen,start_index):w.writerow([idx,tid,sha])
+
+          # Preserve actual pytest nodeid; only reconstruct the CLI file prefix when needed.
+          def cli_nodeid(tid):
+              module=tid.split('::',1)[0]
+              if (source/module).is_file(): return tid
+              if (source/'tests'/module).is_file(): return 'tests/'+tid
+              return None
+
+          def outcome_for(phases, rc, timed_out, resolved):
+              if timed_out or not resolved or rc not in (0,1): return 'N'
+              if any(p.get('outcome')=='failed' for p in phases): return '0'
+              if any(p.get('outcome')=='skipped' for p in phases): return 'S'
+              states={p['phase']:p['outcome'] for p in phases}
+              if all(states.get(k)=='passed' for k in ('setup','call','teardown')):
+                  return '1'
+              return 'N'
+
+          config={
+              'project':'Skyvern Python pytest', 'sha':sha, 'uv_lock_sha256':hashlib.sha256((source/'uv.lock').read_bytes()).hexdigest(),
+              'inventory_sha256':inventory_digest, 'python':platform.python_version(),
+              'platform':platform.platform(), 'runner_image_version':os.environ.get('ImageVersion'),
+              'github_run_id':os.environ.get('GITHUB_RUN_ID'),
+              'github_run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'fresh_pytest_process_per_invocation':True, 'pytest_options':['-p','research_inventory_observer','-vv','--tb=long'],
+              'timeout_seconds':timeout_seconds, 'setting':'isolation',
+              'start_index':start_index,'tests_per_batch':count,
+              'first_run_number':first_run,'repetitions_per_test':repeats,
+              'utc_start':datetime.now(timezone.utc).isoformat(),
+              'note':'Partial batch only. Not full-suite setting or 5000 completed repetitions.'
+          }
+          config_for_comparison={k:v for k,v in config.items() if k not in (
+              'github_run_id','github_run_attempt','start_index','tests_per_batch',
+              'first_run_number','repetitions_per_test','utc_start','note')}
+          cfg_hash=hashlib.sha256(json.dumps(config_for_comparison,sort_keys=True).encode()).hexdigest()
+          config['config_sha256']=cfg_hash
+          (output/'run-config.json').write_text(json.dumps(config,indent=2))
+
+          fields=['test_id','test_name','module','sha','setting','run_number','outcome','wall_seconds',
+                  'exit_code','timed_out','pytest_nodeid','inventory_index','config_sha256',
+                  'log_file','phase_file','utc_finished']
+          long_csv=output/'outcomes-long.csv'
+          counts=Counter(); per_test=defaultdict(dict)
+          with long_csv.open('w',newline='',encoding='utf-8') as f:
+              csv.writer(f).writerow(fields)
+          for index,tid in enumerate(chosen,start_index):
+              cli=cli_nodeid(tid)
+              for run in range(first_run,first_run+repeats):
+                  key=f'i{index:05d}-r{run:04d}'
+                  logfile=logs/f'{key}.log'
+                  phasefile=logs/f'{key}-phases.jsonl'
+                  idfile=logs/f'{key}-collected.jsonl'
+                  elapsed=0;rc=-1;timed_out=False;actual=None
+                  if cli is None or len(cli.encode()) > 12000:
+                      logfile.write_text('NOT EXECUTED: unsupported or oversized CLI nodeid\n',encoding='utf-8')
+                      status='N'
+                  else:
+                      env=dict(os.environ,RESEARCH_COLLECTED_FILE=str(idfile),RESEARCH_PHASE_FILE=str(phasefile))
+                      cmd=['uv','run','--no-sync','python','-m','pytest',
+                           '-p','research_inventory_observer','-vv','--tb=long',cli]
+                      rc,timed_out,elapsed=execute(cmd,source,env,logfile,timeout_seconds)
+                      actual_ids=read_jsonl(idfile)
+                      # Exact, unambiguous one-test identity check: never silently map by name.
+                      if actual_ids==[tid]:
+                          actual=tid
+                      phases=[r for r in read_jsonl(phasefile) if r.get('test_id')==actual] if actual else []
+                      status=outcome_for(phases,rc,timed_out,bool(actual))
+                      if not actual:
+                          with logfile.open('a',encoding='utf-8') as f:
+                              f.write(f'\nID_MAPPING_NOT_VERIFIED: expected={tid!r}; collected={actual_ids!r}\n')
+                  row={'test_id':tid,'test_name':tid.split('::')[-1], 'module':tid.split('::')[0],
+                       'sha':sha,'setting':'isolation','run_number':run,'outcome':status,
+                       'wall_seconds':elapsed,'exit_code':rc,'timed_out':int(timed_out),
+                       'pytest_nodeid':actual or '', 'inventory_index':index,
+                       'config_sha256':cfg_hash,'log_file':str(logfile.relative_to(output)),
+                       'phase_file':str(phasefile.relative_to(output)) if phasefile.exists() else '',
+                       'utc_finished':datetime.now(timezone.utc).isoformat()}
+                  # Crash-tolerant local append after EVERY test invocation; artifact uploads at job end.
+                  with long_csv.open('a',newline='',encoding='utf-8') as f:
+                      writer=csv.DictWriter(f,fieldnames=fields);writer.writerow(row);f.flush();os.fsync(f.fileno())
+                  per_test[tid][run]=status
+                  counts[status]+=1
+                  print(json.dumps({'index':index,'test':tid[-100:],'run':run,
+                                    'outcome':status,'seconds':elapsed}),flush=True)
+          run_numbers=list(range(first_run,first_run+repeats))
+          with (output/'partial-wide.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f);w.writerow(['test_id','test_name','module','sha']+[f'run_{r}' for r in run_numbers])
+              for tid in chosen:
+                  w.writerow([tid,tid.split('::')[-1],tid.split('::')[0],sha]+
+                             [per_test[tid].get(r,'N') for r in run_numbers])
+          with (output/'failure-summary.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f);w.writerow(['test_name','fail_runs_count','first_failing_run','all_failing_runs'])
+              for tid in chosen:
+                  fails=[r for r in run_numbers if per_test[tid].get(r)=='0']
+                  w.writerow([tid,len(fails),fails[0] if fails else '',';'.join(map(str,fails))])
+          expected=count*repeats
+          summary={'source_sha':sha,'setting':'isolation','inventory_sha256':inventory_digest,
+                   'total_inventory_count':len(inventory),'selected_tests':count,
+                   'start_index':start_index,'end_index':start_index+count-1,
+                   'first_run':first_run,'last_run':first_run+repeats-1,
+                   'expected_outcomes':expected,'recorded_outcomes':sum(counts.values()),
+                   'counts':{x:counts[x] for x in ['1','0','S','N']},
+                   'all_5000_completed':False,'full_suite_executed':False,
+                   'data_validated':sum(counts.values())==expected}
+          (output/'batch-summary.json').write_text(json.dumps(summary,indent=2))
+          if sum(counts.values())!=expected: raise RuntimeError('Recorded outcome count mismatch')
+          print('FULL INVENTORY ISOLATION BATCH SUMMARY',json.dumps(summary,indent=2),flush=True)
+          PY
+
+      - name: Execute full-inventory selected test batch in isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python research_tools/execute_inventory_batch.py
+
+      - name: Upload results, audit evidence and execution logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-parallel-step17-shard${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/
+          retention-days: 14
+          if-no-files-found: warn
