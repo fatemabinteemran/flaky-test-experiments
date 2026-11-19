@@ -1,0 +1,304 @@
+name: Skyvern Isolation Repetitions With Verified Outcomes (Step 15)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repetitions_per_test:
+        description: 'Actual isolation repetitions per selected test (1-50; pilot default 10)'
+        required: true
+        type: number
+        default: 10
+      first_run_number:
+        description: 'Global run number for this batch (1-5000)'
+        required: true
+        type: number
+        default: 1
+
+permissions:
+  contents: read
+
+jobs:
+  isolation-batch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+      RESEARCH_OUTPUT: ${{ github.workspace }}/results
+      PYTHONPATH: ${{ github.workspace }}/research_tools
+      CI: 'true'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      REPETITIONS: ${{ inputs.repetitions_per_test }}
+      FIRST_RUN: ${{ inputs.first_run_number }}
+
+    steps:
+      - name: Checkout exact Skyvern commit
+        uses: actions/checkout@v4
+        with:
+          repository: Skyvern-AI/skyvern
+          ref: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+          path: source
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate run inputs and pinned commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESEARCH_OUTPUT" research_tools
+          test "$(git -C source rev-parse HEAD)" = "$EXPECTED_SHA"
+          python - <<'PY'
+          import os
+          n = int(os.environ['REPETITIONS'])
+          first = int(os.environ['FIRST_RUN'])
+          assert 1 <= n <= 50, 'Only 1..50 repetitions per test allowed in this pilot'
+          assert 1 <= first <= 5000 and first + n - 1 <= 5000, 'Invalid global run range'
+          print('Validated range:', first, 'through', first+n-1, 'per test')
+          PY
+
+      - name: Install locked project dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'uv==0.13.9' > "$RESEARCH_OUTPUT/install-uv.log" 2>&1
+          timeout 900s uv sync --locked --extra server --group dev --python "$(command -v python)" \
+            > "$RESEARCH_OUTPUT/install-dependencies.log" 2>&1
+          uv --version > "$RESEARCH_OUTPUT/tool-version.txt"
+          uv run --no-sync python -m pytest --version >> "$RESEARCH_OUTPUT/tool-version.txt" 2>&1
+
+      - name: Write collection-aware pytest recorder and execution engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research_tools/research_observer.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def pytest_collection_finish(session):
+              dst = Path(os.environ['RESEARCH_COLLECTED_FILE'])
+              with dst.open('w', encoding='utf-8') as f:
+                  for item in session.items:
+                      f.write(json.dumps(item.nodeid, ensure_ascii=False) + '\n')
+
+          def pytest_runtest_logreport(report):
+              record = {
+                  'test_id': report.nodeid,
+                  'phase': report.when,
+                  'outcome': report.outcome,
+                  'duration_seconds': report.duration,
+                  'was_xfail': bool(getattr(report, 'wasxfail', False)),
+              }
+              if report.failed:
+                  record['error'] = str(report.longrepr)
+              with Path(os.environ['RESEARCH_PHASE_FILE']).open('a', encoding='utf-8') as f:
+                  f.write(json.dumps(record, ensure_ascii=False) + '\n')
+          PY
+          cat > research_tools/run_isolation.py <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import platform
+          import signal
+          import subprocess
+          import sys
+          import time
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(os.environ['RESEARCH_OUTPUT'])
+          source = Path(os.environ['GITHUB_WORKSPACE']) / 'source'
+          repetitions = int(os.environ['REPETITIONS'])
+          first_run = int(os.environ['FIRST_RUN'])
+          sha = os.environ['EXPECTED_SHA']
+          # These are full CLI node IDs; pytest may emit IDs relative to its rootdir.
+          selected = [
+              'tests/unit/browser_extension/test_broker_client.py::test_replacement_fences_queued_events_and_stop_cancels_forwarder',
+              'tests/unit/browser_extension/test_broker_server.py::test_client_close_does_not_wait_past_grace_for_uncancellable_request',
+              'tests/unit/test_background_task_executor.py::test_lost_first_dispatch_is_recovered_after_a_restart[lookup-fails]',
+          ]
+          limit_seconds = 90
+          logdir = root / 'logs'
+          logdir.mkdir(exist_ok=True)
+          lock_sha256 = hashlib.sha256((source/'uv.lock').read_bytes()).hexdigest()
+          config = {
+              'project': 'Skyvern', 'sha': sha, 'lock_sha256': lock_sha256,
+              'python': platform.python_version(), 'platform': platform.platform(),
+              'runner_os': os.environ.get('RUNNER_OS'),
+              'image_version': os.environ.get('ImageVersion'),
+              'test_command': 'uv run --no-sync python -m pytest -p research_observer -vv --tb=long',
+              'timeout_seconds': limit_seconds, 'test_ids': selected,
+              'setting': 'isolation', 'fresh_pytest_process_per_test_and_repetition': True,
+              'github_run_id': os.environ.get('GITHUB_RUN_ID'),
+              'github_run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'first_run': first_run, 'repetitions_per_test': repetitions,
+              'utc_start': datetime.now(timezone.utc).isoformat(),
+              'notes': 'NOT a full suite. NOT the complete 5000-repetition study.',
+          }
+          config_json = json.dumps({k:v for k,v in config.items() if k not in ('github_run_id','github_run_attempt','first_run','repetitions_per_test','utc_start','notes')}, sort_keys=True)
+          config_hash = hashlib.sha256(config_json.encode()).hexdigest()
+          config['test_configuration_sha256'] = config_hash
+          (root/'run-config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
+
+          fields = ['test_id','test_name','module','sha','setting','run_number','outcome',
+                    'wall_seconds','exit_code','timed_out','pytest_nodeid','config_sha256',
+                    'log_file','phase_file','utc_finished']
+          outcome_file = root/'outcomes-long.csv'
+          with outcome_file.open('w', newline='', encoding='utf-8') as f:
+              csv.writer(f).writerow(fields)
+          results = defaultdict(dict)
+
+          def get_reports(p):
+              output = []
+              if p.exists():
+                  with p.open(encoding='utf-8') as f:
+                      for line in f:
+                          try: output.append(json.loads(line))
+                          except (ValueError, TypeError): pass
+              return output
+
+          def exact_map(cli_id, collected):
+              # Explicit, audited mapping for Skyvern pytest rootdir 'tests'.
+              candidates = [x for x in collected if x == cli_id or
+                            (cli_id.startswith('tests/') and x == cli_id[6:])]
+              return candidates[0] if len(candidates) == 1 else None
+
+          def classify(phases, timeout, code):
+              if timeout or code not in (0, 1):
+                  return 'N'
+              if any(p['outcome'] == 'failed' for p in phases): return '0'
+              if any(p['outcome'] == 'skipped' for p in phases): return 'S'
+              done = {p['phase']:p['outcome'] for p in phases}
+              if all(done.get(x) == 'passed' for x in ('setup','call','teardown')):
+                  return '1'
+              return 'N'
+
+          for index, tid in enumerate(selected, start=1):
+              for run in range(first_run, first_run+repetitions):
+                  tag = f't{index:02d}-r{run:04d}'
+                  log_path = logdir/f'{tag}.log'
+                  phase_path = logdir/f'{tag}-phases.jsonl'
+                  collected_path = logdir/f'{tag}-collected.jsonl'
+                  cmd = ['uv','run','--no-sync','python','-m','pytest',
+                         '-p','research_observer','-vv','--tb=long',tid]
+                  env = dict(os.environ,
+                      RESEARCH_PHASE_FILE=str(phase_path),
+                      RESEARCH_COLLECTED_FILE=str(collected_path))
+                  t0 = time.monotonic()
+                  timeout = False
+                  with log_path.open('w', encoding='utf-8') as f:
+                      f.write(f'CLI_TEST_ID={tid}\nRUN={run}\nCMD={cmd!r}\n')
+                      f.flush()
+                      proc = subprocess.Popen(cmd, cwd=source, env=env,
+                                              stdout=f, stderr=subprocess.STDOUT,
+                                              start_new_session=True)
+                      try:
+                          rc = proc.wait(timeout=limit_seconds)
+                      except subprocess.TimeoutExpired:
+                          timeout = True
+                          os.killpg(proc.pid, signal.SIGINT)
+                          try: rc = proc.wait(timeout=6)
+                          except subprocess.TimeoutExpired:
+                              os.killpg(proc.pid, signal.SIGTERM)
+                              try: rc = proc.wait(timeout=4)
+                              except subprocess.TimeoutExpired:
+                                  os.killpg(proc.pid, signal.SIGKILL)
+                                  rc = proc.wait()
+                          f.write('\nRESEARCH_TIMEOUT_EXCEEDED: missing outcome N\n')
+                  elapsed = round(time.monotonic()-t0, 4)
+                  collected = [x for x in get_reports(collected_path) if isinstance(x,str)]
+                  actual_id = exact_map(tid, collected)
+                  reports = get_reports(phase_path)
+                  matched = [r for r in reports if r.get('test_id') == actual_id]
+                  outcome = classify(matched, timeout, rc) if actual_id else 'N'
+                  if actual_id is None:
+                      with log_path.open('a', encoding='utf-8') as f:
+                          f.write(f'\nRESEARCH_MAPPING_FAILURE: expected {tid!r}; collected={collected!r}\n')
+                  row = {
+                      'test_id': actual_id if actual_id else tid,
+                      'test_name': (actual_id or tid).split('::')[-1],
+                      'module': (actual_id or tid).split('::')[0],
+                      'sha':sha,'setting':'isolation','run_number':run,
+                      'outcome':outcome,'wall_seconds':elapsed,'exit_code':rc,
+                      'timed_out':int(timeout),'pytest_nodeid':actual_id or '',
+                      'config_sha256':config_hash,
+                      'log_file':str(log_path.relative_to(root)),
+                      'phase_file':str(phase_path.relative_to(root)),
+                      'utc_finished':datetime.now(timezone.utc).isoformat(),
+                  }
+                  # A durable append after every *completed invocation*.
+                  with outcome_file.open('a', newline='', encoding='utf-8') as f:
+                      writer = csv.DictWriter(f, fieldnames=fields)
+                      writer.writerow(row)
+                      f.flush()
+                      os.fsync(f.fileno())
+                  results[tid][run] = row
+                  print(f'ISOLATION {tag} outcome={outcome} duration={elapsed}s'
+                        f' mapped={actual_id is not None}', flush=True)
+
+          expected = len(selected)*repetitions
+          with outcome_file.open(newline='',encoding='utf-8') as f:
+              rows = list(csv.DictReader(f))
+          if len(rows) != expected:
+              raise RuntimeError(f'Expected {expected} CSV rows; found {len(rows)}')
+          keys = [(r['test_id'],r['run_number']) for r in rows]
+          if len(set(keys)) != len(keys):
+              raise RuntimeError('Duplicate actual ID + global run number')
+          if sum(r['outcome'] in ('1','0','S') for r in rows)==0:
+              raise RuntimeError('No valid pytest outcomes; see diagnostic logs')
+          if any(r['test_id'] != r['pytest_nodeid'] for r in rows):
+              raise RuntimeError('At least one test ID could not be verified; check mapping logs')
+          with (root/'isolation-partial-wide.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f)
+              w.writerow(['test_id','test_name','module','sha'] +
+                         [f'run_{i}' for i in range(first_run,first_run+repetitions)])
+              for tid in selected:
+                  h=results[tid]
+                  first=h[first_run]
+                  w.writerow([first['test_id'],first['test_name'],first['module'],sha] +
+                             [h[i]['outcome'] for i in range(first_run,first_run+repetitions)])
+          with (root/'isolation-failure-summary.csv').open('w',newline='',encoding='utf-8') as f:
+              w=csv.writer(f)
+              w.writerow(['test_name','fail_runs_count','first_failing_run','all_failing_runs'])
+              for tid in selected:
+                  h=results[tid]
+                  failures=[i for i in range(first_run,first_run+repetitions) if h[i]['outcome']=='0']
+                  w.writerow([h[first_run]['test_id'],len(failures),
+                              failures[0] if failures else '', ';'.join(map(str,failures))])
+          summary={
+              'sha':sha,'setting':'isolation','first_run':first_run,
+              'last_run':first_run+repetitions-1, 'test_count':len(selected),
+              'expected_outcomes':expected,'recorded_outcomes':len(rows),
+              'counts':{s:sum(r['outcome']==s for r in rows) for s in ('1','0','S','N')},
+              'id_mapping_verified':True,
+              'full_suite_executed':False,
+              'all_5000_repetitions_completed':False,
+              'note':'This is a limited batch of isolation-only repetitions, not the professor\'s entire requirement.'
+          }
+          (root/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          print(json.dumps(summary,indent=2),flush=True)
+          PY
+          python -m py_compile research_tools/research_observer.py research_tools/run_isolation.py
+
+      - name: Execute real isolation repetitions with per-run checkpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python research_tools/run_isolation.py
+
+      - name: Upload all execution data (even if run fails)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-isolation-step15-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
