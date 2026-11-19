@@ -199,10 +199,22 @@ jobs:
           # Exclude them from this stable-index batch. Preserve and investigate separately.
           dynamic_prefix = ('tests/unit/browser_extension/test_relay.py::'
                             'test_client_nonce_must_be_unpadded_base64url_for_exactly_32_bytes[')
-          dynamic = [tid for tid in raw_ids if tid.startswith(dynamic_prefix)]
-          inventory = sorted(tid for tid in raw_ids if not tid.startswith(dynamic_prefix))
+          # This parameterized test has SIX cases. Three parameters are deterministic:
+          # 'short', all punctuation, and the fixed A...B string. The remaining
+          # three are random base64url strings that change at each collection.
+          fixed_parameters = (
+              'short',
+              '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!',
+              'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB',
+          )
+          expected_fixed_ids = {dynamic_prefix + value + ']' for value in fixed_parameters}
+          nonce_ids = [tid for tid in raw_ids if tid.startswith(dynamic_prefix)]
+          if len(nonce_ids) != 6 or not expected_fixed_ids.issubset(set(nonce_ids)):
+              raise RuntimeError('Unexpected nonce parameterization; aborting to protect test identity')
+          dynamic = [tid for tid in nonce_ids if tid not in expected_fixed_ids]
+          inventory = sorted(tid for tid in raw_ids if tid not in set(dynamic))
           assert len(dynamic) == 3 and len(inventory) == len(set(inventory)) == 35773, (
-              f'Unexpected dynamic ID count {len(dynamic)} or stable count {len(inventory)}')
+              f'Unexpected random ID count {len(dynamic)} or stable count {len(inventory)}')
           inventory_digest = hashlib.sha256(json.dumps(inventory,ensure_ascii=False).encode()).hexdigest()
           expected_stable_digest = 'ceaf5226500a321838b802cac833522347f54e483911b7f490cf62243ca211fa'
           assert inventory_digest == expected_stable_digest, (
