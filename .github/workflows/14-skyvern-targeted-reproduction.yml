@@ -1,0 +1,233 @@
+name: Skyvern Targeted Failure Reproduction (Step 14)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+      CI: 'true'
+      PYTHONUNBUFFERED: '1'
+      PYTHONFAULTHANDLER: '1'
+      PYTHONPATH: ${{ github.workspace }}/research_tools
+      RESEARCH_OUTPUT: ${{ github.workspace }}/diagnostics
+    steps:
+      - name: Checkout pinned Skyvern commit
+        uses: actions/checkout@v4
+        with:
+          repository: Skyvern-AI/skyvern
+          ref: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+          path: source
+          persist-credentials: false
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify source and record environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESEARCH_OUTPUT" research_tools
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_SHA"
+          {
+            echo "project=Skyvern"
+            echo "sha=$actual"
+            echo "start_utc=$(date -u +%FT%TZ)"
+            python --version
+            nproc
+            free -h
+            echo "Scope: Targeted reproduction, not full-suite or 5000-run experiment"
+          } > "$RESEARCH_OUTPUT/environment.txt"
+      - name: Install locked Python dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install 'uv==0.13.9' > "$RESEARCH_OUTPUT/install-uv.log" 2>&1
+          timeout 900s uv sync --locked --extra server --group dev --python "$(command -v python)" \
+            > "$RESEARCH_OUTPUT/install-dependencies.log" 2>&1
+          uv --version >> "$RESEARCH_OUTPUT/environment.txt"
+          uv run --no-sync python -m pytest --version >> "$RESEARCH_OUTPUT/environment.txt"
+      - name: Create per-phase recorder and repetition runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > research_tools/research_phase_recorder.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def pytest_runtest_logreport(report):
+              record = {
+                  'test_id': report.nodeid,
+                  'phase': report.when,
+                  'outcome': report.outcome,
+                  'duration_seconds': round(report.duration, 7),
+                  'xfail': bool(getattr(report, 'wasxfail', False)),
+              }
+              if report.failed:
+                  record['error'] = str(report.longrepr)[:30000]
+              with Path(os.environ['PHASE_LOG']).open('a', encoding='utf-8') as f:
+                  f.write(json.dumps(record, ensure_ascii=False) + '\n')
+          PY
+          cat > research_tools/reproduce.py <<'PY'
+          import csv
+          import json
+          import os
+          import signal
+          import subprocess
+          import time
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(os.environ['RESEARCH_OUTPUT'])
+          source = Path(os.environ['GITHUB_WORKSPACE']) / 'source'
+          failed_ids = [
+              'tests/unit/browser_extension/test_broker_client.py::test_replacement_fences_queued_events_and_stop_cancels_forwarder',
+              'tests/unit/browser_extension/test_broker_server.py::test_client_close_does_not_wait_past_grace_for_uncancellable_request',
+          ]
+          incomplete_id = 'tests/unit/test_background_task_executor.py::test_lost_first_dispatch_is_recovered_after_a_restart[lookup-fails]'
+          # Runs of the 2 observed failures individually, followed by the interrupted
+          # test individually, then a 2-test SUBSET. The subset is NOT a full suite.
+          plans = []
+          for test_id in failed_ids:
+              for repeat in range(1, 6):
+                  plans.append(('isolation', repeat, [test_id]))
+          for repeat in range(1, 3):
+              plans.append(('isolation', repeat, [incomplete_id]))
+          for repeat in range(1, 4):
+              plans.append(('two-test-subset-NOT-full-suite', repeat, failed_ids))
+
+          def determine_outcome(phases, timed_out):
+              if timed_out:
+                  return 'N'
+              if any(r['outcome'] == 'failed' for r in phases):
+                  return '0'
+              if any(r['outcome'] == 'skipped' for r in phases):
+                  return 'S'
+              if (any(r['phase'] == 'call' and r['outcome'] == 'passed' for r in phases)
+                      and any(r['phase'] == 'teardown' and r['outcome'] == 'passed' for r in phases)):
+                  return '1'
+              return 'N'
+
+          rows = []
+          invocations = []
+          for index, (setting, repeat, selected) in enumerate(plans, 1):
+              tag = f'invocation-{index:02d}'
+              log_path = root / f'{tag}.log'
+              phase_path = root / f'{tag}-phases.jsonl'
+              command = ['uv', 'run', '--no-sync', 'python', '-m', 'pytest',
+                         '-p', 'research_phase_recorder', '-q', '--tb=short', *selected]
+              env = dict(os.environ, PHASE_LOG=str(phase_path))
+              # Run each test in a separate process for isolation; subset is grouped.
+              timeout_seconds = 90 if incomplete_id in selected else 75
+              start = time.monotonic()
+              timed_out = False
+              exit_code = None
+              with log_path.open('w', encoding='utf-8') as log:
+                  log.write(f'setting={setting} repeat={repeat} tests={selected}\n')
+                  log.write(f'command={command!r}\n')
+                  log.flush()
+                  proc = subprocess.Popen(command, cwd=source, env=env,
+                                          stdout=log, stderr=subprocess.STDOUT,
+                                          start_new_session=True)
+                  try:
+                      exit_code = proc.wait(timeout=timeout_seconds)
+                  except subprocess.TimeoutExpired:
+                      timed_out = True
+                      os.killpg(proc.pid, signal.SIGINT)
+                      try:
+                          exit_code = proc.wait(timeout=8)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(proc.pid, signal.SIGTERM)
+                          try:
+                              exit_code = proc.wait(timeout=5)
+                          except subprocess.TimeoutExpired:
+                              os.killpg(proc.pid, signal.SIGKILL)
+                              exit_code = proc.wait()
+                      log.write('\nTIMEOUT: incomplete invocation\n')
+              duration = round(time.monotonic() - start, 3)
+              observed = defaultdict(list)
+              if phase_path.exists():
+                  for line in phase_path.read_text(encoding='utf-8').splitlines():
+                      try:
+                          entry = json.loads(line)
+                          observed[entry['test_id']].append(entry)
+                      except (ValueError, KeyError):
+                          continue
+              for test_id in selected:
+                  phases = observed.get(test_id, [])
+                  outcome = determine_outcome(phases, timed_out)
+                  rows.append({
+                      'test_id': test_id,
+                      'setting': setting,
+                      'run': repeat,
+                      'outcome': outcome,
+                      'sha': os.environ['EXPECTED_SHA'],
+                      'invocation': tag,
+                      'duration_seconds': duration,
+                      'exit_code': exit_code,
+                      'timed_out': int(timed_out),
+                      'log_file': log_path.name,
+                      'phase_file': phase_path.name,
+                  })
+                  print(f'{setting} run={repeat} outcome={outcome} test={test_id}', flush=True)
+              invocations.append({
+                  'tag': tag,
+                  'setting': setting,
+                  'repeat': repeat,
+                  'test_ids': selected,
+                  'duration_seconds': duration,
+                  'exit_code': exit_code,
+                  'timed_out': timed_out,
+              })
+              # Checkpoint after each invocation, even when an outcome is N.
+              with (root / 'outcomes.csv').open('w', newline='', encoding='utf-8') as f:
+                  writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+                  writer.writeheader()
+                  writer.writerows(rows)
+              (root / 'invocations.json').write_text(
+                  json.dumps(invocations, indent=2, ensure_ascii=False), encoding='utf-8')
+
+          (root / 'summary.json').write_text(json.dumps({
+              'project': 'Skyvern',
+              'sha': os.environ['EXPECTED_SHA'],
+              'generated_utc': datetime.now(timezone.utc).isoformat(),
+              'scope': 'two previously failing tests in isolation and together in subset; interrupted test in isolation',
+              'note': 'Subset execution is NOT a full-suite result; at most 5 repetitions per test, not 5000.',
+              'outcomes': rows,
+          }, indent=2, ensure_ascii=False), encoding='utf-8')
+          # Summary CSV for the isolation setting only; use full IDs and preserve N/S.
+          isolated = defaultdict(list)
+          for row in rows:
+              if row['setting'] == 'isolation':
+                  isolated[row['test_id']].append(row)
+          with (root / 'isolation-failure-summary.csv').open('w', newline='', encoding='utf-8') as f:
+              writer = csv.writer(f)
+              writer.writerow(['test_name','fail_runs_count','first_failing_run','all_failing_runs'])
+              for test_id, history in isolated.items():
+                  failures = [str(r['run']) for r in history if r['outcome'] == '0']
+                  writer.writerow([test_id, len(failures), failures[0] if failures else '', ';'.join(failures)])
+          print('Completed targeted diagnostic, see diagnostics/summary.json', flush=True)
+          PY
+          python -m py_compile research_tools/*.py
+      - name: Run targeted repetitions and preserve execution logs
+        shell: bash
+        run: |
+          python research_tools/reproduce.py
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-targeted-reproduction-step14
+          path: diagnostics/
+          retention-days: 14
+          if-no-files-found: warn
