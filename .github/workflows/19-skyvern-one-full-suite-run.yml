@@ -10,7 +10,7 @@ on:
         required: true
         default: 1
       execution_limit_minutes:
-        description: 'Full-suite execution cap, 30-210 min (not total job time)'
+        description: 'Full-suite execution cap, 30-210 min'
         type: number
         required: true
         default: 180
@@ -22,6 +22,7 @@ jobs:
   full-suite-one-run:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+
     env:
       EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
       RESEARCH_OUTPUT: ${{ github.workspace }}/suite_results
@@ -88,6 +89,11 @@ jobs:
                   for item in session.items:
                       file.write(json.dumps(item.nodeid, ensure_ascii=False) + '\n')
 
+          # Preserve original low-level I/O before test monkeypatches.
+          RAW_OPEN = os.open
+          RAW_WRITE = os.write
+          RAW_CLOSE = os.close
+
           def pytest_runtest_logreport(report):
               entry = {
                   'nodeid': report.nodeid,
@@ -96,21 +102,27 @@ jobs:
                   'duration_seconds': round(report.duration, 6),
                   'expected_failure': bool(getattr(report, 'wasxfail', False)),
               }
+
               if report.failed:
                   entry['error'] = str(report.longrepr)
-              
-                  payload = (json.dumps(entry, ensure_ascii=False) + '\n').encode('utf-8')
-                  
-                  fd = os.open(
-                      str(ROOT / 'phase-reports.jsonl'),
-                      os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                      0o600,
-                  )
-                  try:
-                      os.write(fd, payload)
-                  finally:
-                      os.close(fd)
 
+              payload = (json.dumps(entry, ensure_ascii=False) + '\n').encode('utf-8')
+
+              fd = RAW_OPEN(
+                  str(ROOT / 'phase-reports.jsonl'),
+                  os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                  0o600,
+              )
+
+              try:
+                  view = memoryview(payload)
+                  while view:
+                      written = RAW_WRITE(fd, view)
+                      if written <= 0:
+                          raise OSError('Recorder journal write returned zero bytes')
+                      view = view[written:]
+              finally:
+                  RAW_CLOSE(fd)
           PY
 
           cat > research_tools/run_complete_suite.py <<'PY'
@@ -157,6 +169,7 @@ jobs:
               return 'tests/' + nid if nid.startswith('unit/') else nid
 
           start_utc = utc_now()
+
           cmd = [
               'uv', 'run', '--no-sync', 'python', '-m', 'pytest',
               '-p', 'research_full_suite_recorder',
@@ -190,10 +203,12 @@ jobs:
               except subprocess.TimeoutExpired:
                   timed_out = True
                   os.killpg(proc.pid, signal.SIGINT)
+
                   try:
                       exit_code = proc.wait(timeout=12)
                   except subprocess.TimeoutExpired:
                       os.killpg(proc.pid, signal.SIGTERM)
+
                       try:
                           exit_code = proc.wait(timeout=8)
                       except subprocess.TimeoutExpired:
@@ -236,6 +251,7 @@ jobs:
           ]
 
           dynamic_set = set(dynamic_positions)
+
           stable = sorted(
               val for i, val in enumerate(normalized)
               if i not in dynamic_set
@@ -380,6 +396,7 @@ jobs:
                   'test_id', 'test_name', 'module', 'sha',
                   f'run_{run_number}'
               ])
+
               for row in rows:
                   writer.writerow([
                       row['test_id'],
@@ -399,6 +416,7 @@ jobs:
                   'first_failing_run',
                   'all_failing_runs'
               ])
+
               for row in rows:
                   failed = row['outcome'] == '0'
                   writer.writerow([
@@ -474,6 +492,51 @@ jobs:
                   'one of the 5000 complete suite repetitions.',
                   flush=True
               )
+          PY
+
+      - name: Smoke-test recorder against simulated disk-full monkeypatch
+        shell: bash
+        working-directory: source
+        env:
+          RESEARCH_OUTPUT: ${{ github.workspace }}/suite_results/recorder_smoke
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESEARCH_OUTPUT"
+
+          uv run --no-sync python -m pytest \
+            -p research_full_suite_recorder -q --tb=short \
+            tests/unit/test_data_export_block.py::test_export_block_returns_clean_failure_when_writing_parquet_fails \
+            > "$RESEARCH_OUTPUT/smoke-pytest.log" 2>&1 || {
+              cat "$RESEARCH_OUTPUT/smoke-pytest.log"
+              exit 1
+            }
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['RESEARCH_OUTPUT'])
+          journal = root / 'phase-reports.jsonl'
+
+          assert journal.exists(), 'Smoke test did not create a report journal'
+
+          records = [
+              json.loads(line)
+              for line in journal.read_text().splitlines()
+          ]
+
+          assert any(
+              r['phase'] == 'call' and r['outcome'] == 'passed'
+              for r in records
+          ), 'Smoke test did not pass'
+
+          assert any(
+              r['phase'] == 'teardown' and r['outcome'] == 'passed'
+              for r in records
+          ), 'Smoke test teardown did not complete'
+
+          print('Recorder passed simulated disk-full smoke test')
           PY
 
       - name: Run the full suite once with per-test outcome journal
