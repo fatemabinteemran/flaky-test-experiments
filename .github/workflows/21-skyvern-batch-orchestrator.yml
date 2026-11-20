@@ -1,0 +1,506 @@
+
+name: Skyvern Batch Orchestrator (Step 21)
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_run_number:
+        description: "First unused suite run number (27 for initial pilot)"
+        required: true
+        type: number
+        default: 27
+      batches:
+        description: "Consecutive Step 20 batches (1 or 2; eight suites each)"
+        required: true
+        type: number
+        default: 1
+      per_run_limit_minutes:
+        description: "Use the verified Step 20 timeout (65)"
+        required: true
+        type: number
+        default: 65
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: skyvern-step21-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      BRANCH: ${{ github.ref_name }}
+      FIRST: ${{ inputs.first_run_number }}
+      BATCHES: ${{ inputs.batches }}
+      LIMIT: ${{ inputs.per_run_limit_minutes }}
+
+    steps:
+      - name: Dispatch, monitor, download and verify Step 20 runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p step21_results
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          repo = os.environ['REPOSITORY']
+          branch = os.environ['BRANCH']
+          first = int(os.environ['FIRST'])
+          batches = int(os.environ['BATCHES'])
+          limit = int(os.environ['LIMIT'])
+          out = Path('step21_results')
+          target = '20-skyvern-parallel-full-suite.yml'
+          expected_sha = 'dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb'
+
+          if first < 27 or first + 8 * batches - 1 > 5000:
+              raise ValueError('Invalid run range or overlap with verified runs #1-26')
+
+          if batches not in (1, 2) or not 30 <= limit <= 70:
+              raise ValueError('Use batches=1 or 2, and 30<=limit<=70')
+
+          if branch != 'main':
+              raise ValueError('This pilot must be launched from the main branch')
+
+          def gh_json(*args):
+              result = subprocess.run(
+                  [
+                      'gh', 'api', '-H',
+                      'X-GitHub-Api-Version: 2026-03-10',
+                      *args
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True
+              )
+              return json.loads(result.stdout) if result.stdout.strip() else {}
+
+          def save_json(name, data):
+              (out / name).write_text(
+                  json.dumps(data, indent=2),
+                  encoding='utf-8'
+              )
+
+          manifest = []
+
+          for b in range(batches):
+              start = first + 8 * b
+              end = start + 7
+
+              print(
+                  f'Dispatching verified Step 20 for suites {start}-{end}',
+                  flush=True
+              )
+
+              dispatched = gh_json(
+                  '-X', 'POST',
+                  f'repos/{repo}/actions/workflows/{target}/dispatches',
+                  '-f', f'ref={branch}',
+                  '-f', f'inputs[first_run_number]={start}',
+                  '-f', f'inputs[per_run_limit_minutes]={limit}'
+              )
+
+              run_id = dispatched.get('workflow_run_id')
+
+              if not isinstance(run_id, int):
+                  raise RuntimeError(
+                      f'No unambiguous workflow_run_id returned: {dispatched}'
+                  )
+
+              details = {
+                  'batch': b + 1,
+                  'first_run': start,
+                  'last_run': end,
+                  'workflow_run_id': run_id,
+                  'url': dispatched.get(
+                      'html_url',
+                      f'https://github.com/{repo}/actions/runs/{run_id}'
+                  ),
+                  'conclusion': None
+              }
+
+              manifest.append(details)
+              save_json('dispatch-manifest.json', manifest)
+
+              deadline = time.monotonic() + 3 * 3600
+              prior_status = None
+
+              while True:
+                  state = gh_json(
+                      f'repos/{repo}/actions/runs/{run_id}'
+                  )
+                  status = state.get('status')
+
+                  if status != prior_status:
+                      print(
+                          f'Workflow run {run_id}: {status}',
+                          flush=True
+                      )
+                      prior_status = status
+
+                  if status == 'completed':
+                      details['conclusion'] = state.get('conclusion')
+                      break
+
+                  if time.monotonic() > deadline:
+                      details['conclusion'] = 'monitor_timeout'
+                      break
+
+                  time.sleep(30)
+
+              save_json('dispatch-manifest.json', manifest)
+
+              dest = out / f'batch_{b+1:02d}'
+              dest.mkdir(exist_ok=True)
+
+              print(
+                  f'Downloading artifacts for run {run_id}',
+                  flush=True
+              )
+
+              attempt = subprocess.run(
+                  [
+                      'gh', 'run', 'download', str(run_id),
+                      '--repo', repo, '--dir', str(dest)
+                  ],
+                  text=True,
+                  capture_output=True
+              )
+
+              if attempt.returncode:
+                  details['download_error'] = (
+                      attempt.stderr.strip()[:1500]
+                  )
+                  print(
+                      'Download issue:',
+                      details['download_error'],
+                      flush=True
+                  )
+
+              save_json('dispatch-manifest.json', manifest)
+
+          all_runs = {}
+          issues = []
+          stats = defaultdict(lambda: defaultdict(Counter))
+          test_metadata = {}
+
+          combined = out / 'outcomes-long.csv'
+
+          fields = [
+              'test_id',
+              'run_number',
+              'outcome',
+              'setting',
+              'config_sha256',
+              'dynamic_parameter',
+              'sha'
+          ]
+
+          with combined.open(
+              'w', newline='', encoding='utf-8'
+          ) as fh:
+
+              writer = csv.DictWriter(
+                  fh, fieldnames=fields
+              )
+              writer.writeheader()
+
+              for b in range(batches):
+                  folder = out / f'batch_{b+1:02d}'
+                  summaries = sorted(
+                      folder.rglob('suite-summary.json')
+                  )
+
+                  if len(summaries) != 8:
+                      issues.append(
+                          f'Batch {b+1}: expected 8 artifacts, '
+                          f'found {len(summaries)}'
+                      )
+
+                  expected_nums = set(
+                      range(first + 8*b, first + 8*b + 8)
+                  )
+
+                  actual_nums = set()
+
+                  for summary_path in summaries:
+                      d = summary_path.parent
+
+                      summary = json.loads(
+                          summary_path.read_text(encoding='utf-8')
+                      )
+
+                      cfg_path = d / 'run-config.json'
+                      data_path = d / 'outcomes-long.csv'
+
+                      if (
+                          not cfg_path.exists()
+                          or not data_path.exists()
+                      ):
+                          issues.append(
+                              f'{d}: missing config or outcomes'
+                          )
+                          continue
+
+                      config = json.loads(
+                          cfg_path.read_text(encoding='utf-8')
+                      )
+
+                      number = int(summary['run_number'])
+                      actual_nums.add(number)
+
+                      if number in all_runs:
+                          issues.append(
+                              f'Duplicate run number: {number}'
+                          )
+
+                      all_runs[number] = summary
+
+                      if not summary.get('complete_suite_run'):
+                          issues.append(
+                              f'Run {number} incomplete'
+                          )
+
+                      if not summary.get('inventory_verified'):
+                          issues.append(
+                              f'Run {number} inventory not verified'
+                          )
+
+                      if config.get('source_commit') != expected_sha:
+                          issues.append(
+                              f'Run {number} source SHA mismatch'
+                          )
+
+                      config_sha = config.get(
+                          'config_sha256', ''
+                      )
+
+                      if config_sha != summary.get('config_sha256'):
+                          issues.append(
+                              f'Run {number} configuration SHA mismatch'
+                          )
+
+                      seen = set()
+                      count = Counter()
+
+                      with data_path.open(
+                          newline='', encoding='utf-8'
+                      ) as df:
+
+                          for r in csv.DictReader(df):
+                              tid = r['test_id']
+
+                              if tid in seen:
+                                  issues.append(
+                                      f'Run {number} duplicated test ID: '
+                                      f'{tid[:80]}'
+                                  )
+
+                              seen.add(tid)
+
+                              if int(r['run_number']) != number:
+                                  issues.append(
+                                      f'Run {number} row number mismatch'
+                                  )
+
+                              val = r['outcome']
+
+                              if val not in ('0', '1', 'S', 'N'):
+                                  issues.append(
+                                      f'Run {number} unexpected outcome '
+                                      f'{val!r}'
+                                  )
+
+                              count[val] += 1
+
+                              dynamic = (
+                                  r.get('dynamic_parameter') == 'True'
+                              )
+
+                              writer.writerow({
+                                  'test_id': tid,
+                                  'run_number': number,
+                                  'outcome': val,
+                                  'setting': 'full_suite',
+                                  'config_sha256': config_sha,
+                                  'dynamic_parameter': dynamic,
+                                  'sha': expected_sha
+                              })
+
+                              test_metadata[tid] = dynamic
+
+                              if not dynamic:
+                                  stats[tid][config_sha][val] += 1
+
+                      if len(seen) != 35776:
+                          issues.append(
+                              f'Run {number}: {len(seen)} unique IDs '
+                              f'instead of 35776'
+                          )
+
+                      for value, field in [
+                          ('1', 'passed'),
+                          ('0', 'failed'),
+                          ('S', 'skipped'),
+                          ('N', 'missing')
+                      ]:
+                          if count[value] != summary.get(field):
+                              issues.append(
+                                  f'Run {number}: {field} mismatch'
+                              )
+
+                  if actual_nums != expected_nums:
+                      issues.append(
+                          f'Batch {b+1} runs mismatch: '
+                          f'expected {sorted(expected_nums)}, '
+                          f'got {sorted(actual_nums)}'
+                      )
+
+          flaky = []
+
+          for tid, groups in stats.items():
+              for fingerprint, count in groups.items():
+                  if count['1'] > 0 and count['0'] > 0:
+                      flaky.append({
+                          'test_id': tid,
+                          'config_sha256': fingerprint,
+                          'passes': count['1'],
+                          'fails': count['0']
+                      })
+
+          with (out / 'flaky-candidates.csv').open(
+              'w', newline='', encoding='utf-8'
+          ) as fh:
+
+              w = csv.DictWriter(
+                  fh,
+                  fieldnames=[
+                      'test_id',
+                      'config_sha256',
+                      'passes',
+                      'fails'
+                  ]
+              )
+
+              w.writeheader()
+              w.writerows(flaky)
+
+          report_fields = [
+              'run_number',
+              'complete_suite_run',
+              'passed',
+              'failed',
+              'skipped',
+              'missing',
+              'wall_seconds',
+              'config_sha256'
+          ]
+
+          with (out / 'run-manifest.csv').open(
+              'w', newline='', encoding='utf-8'
+          ) as fh:
+
+              w = csv.DictWriter(
+                  fh, fieldnames=report_fields
+              )
+              w.writeheader()
+
+              for number, data in sorted(all_runs.items()):
+                  w.writerow({
+                      k: data.get(k, '')
+                      for k in report_fields
+                  })
+
+          save_json(
+              'validation.json',
+              {
+                  'requested_runs': list(
+                      range(first, first + 8*batches)
+                  ),
+                  'received_runs': sorted(all_runs),
+                  'all_complete': (
+                      all(
+                          x.get('complete_suite_run')
+                          for x in all_runs.values()
+                      )
+                      and len(all_runs) == 8*batches
+                      and not issues
+                  ),
+                  'issues': issues,
+                  'flaky_candidates_within_this_batch': len(flaky),
+                  'warning': (
+                      'Runner image may vary. Generated-parameter '
+                      'slots are excluded from flaky classification. '
+                      'This batch is not automatically combined '
+                      'with previous runs #1-26.'
+                  )
+              }
+          )
+
+          summary_file = os.environ.get(
+              'GITHUB_STEP_SUMMARY'
+          )
+
+          if summary_file:
+              with open(
+                  summary_file,
+                  'a',
+                  encoding='utf-8'
+              ) as f:
+
+                  f.write(
+                      f'## Skyvern Step 21: Runs '
+                      f'{first}-{first+8*batches-1}\n\n'
+                  )
+
+                  f.write(
+                      f'- Complete downloaded runs: '
+                      f'**{len(all_runs)}/{8*batches}**\n'
+                  )
+
+                  f.write(
+                      f'- Validation issues: '
+                      f'**{len(issues)}**\n'
+                  )
+
+                  f.write(
+                      f'- Candidate Pass/Fail transitions '
+                      f'in matching config: **{len(flaky)}**\n'
+                  )
+
+                  for m in manifest:
+                      f.write(
+                          f'- [Batch {m["batch"]}]({m["url"]}): '
+                          f'{m["conclusion"]}\n'
+                      )
+
+          print(
+              'Step 21 validation issues:',
+              issues[:10],
+              flush=True
+          )
+
+          if issues:
+              sys.exit(1)
+          PY
+
+      - name: Preserve merged CSV, validation reports and original execution logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvern-step21-batch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: step21_results/
+          retention-days: 90
+          if-no-files-found: warn
