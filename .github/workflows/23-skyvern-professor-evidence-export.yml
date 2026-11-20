@@ -1,5 +1,5 @@
 
-name: Step 23 - Export Skyvern Evidence for Professor
+name: Skyvern Python Full-Suite Research Evidence Export
 
 on:
   workflow_dispatch:
@@ -861,7 +861,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Skyvern_Python_FullSuite_Runs_1_to_66_Professor_Evidence
+          name: Skyvern_Python_FullSuite_Interim_Results_Runs_001-066
           path: professor_export/
           retention-days: 90
           compression-level: 6
