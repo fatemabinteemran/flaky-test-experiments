@@ -1,0 +1,668 @@
+
+name: Skyvern Lightweight Results Export
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Original Step 20 GitHub Actions run ID"
+        required: true
+        type: string
+        default: "44916281592"
+      first_run_number:
+        description: "First suite repetition in the batch"
+        required: true
+        type: number
+        default: 83
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      FIRST_RUN: ${{ inputs.first_run_number }}
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+
+    steps:
+      - name: Download original artifacts inside GitHub
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p original report
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" \
+            > source_run.json
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100" \
+            > source_artifacts.json
+
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir original
+
+      - name: Verify original outcomes and generate compact CSVs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          root = Path("original")
+          out = Path("report")
+          sha = os.environ["EXPECTED_SHA"]
+          source_id = os.environ["SOURCE_RUN_ID"]
+          first = int(os.environ["FIRST_RUN"])
+          expected = set(range(first, first + 8))
+
+          def check(ok, message):
+              if not ok:
+                  raise RuntimeError(message)
+
+          def load(path):
+              return json.loads(
+                  path.read_text(encoding="utf-8")
+              )
+
+          def save_csv(name, fields, rows):
+              with (out / name).open(
+                  "w", newline="", encoding="utf-8"
+              ) as f:
+                  writer = csv.DictWriter(
+                      f, fieldnames=fields
+                  )
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def normalize(nodeid):
+              if nodeid.startswith("unit/"):
+                  return "tests/" + nodeid
+              return nodeid
+
+          def outcome(flags):
+              if flags & 1:
+                  return "0"
+              if flags & 2:
+                  return "S"
+              if flags & 28 == 28:
+                  return "1"
+              return "N"
+
+          source = load(Path("source_run.json"))
+          metadata = load(Path("source_artifacts.json"))
+
+          check(
+              source.get("conclusion") == "success",
+              "Original workflow did not succeed"
+          )
+          check(
+              source.get("name") ==
+              "Skyvern Parallel Full-Suite Repetitions (Step 20)",
+              "Wrong source workflow"
+          )
+
+          artifacts = metadata.get("artifacts", [])
+          check(
+              len(artifacts) == 8,
+              "Expected exactly 8 original artifacts"
+          )
+          check(
+              all(not a.get("expired") for a in artifacts),
+              "One or more original artifacts expired"
+          )
+
+          artifact_info = {
+              a["name"]: a for a in artifacts
+          }
+
+          folders = sorted(
+              p.parent for p in root.glob(
+                  "*/suite-summary.json"
+              )
+          )
+
+          check(
+              len(folders) == 8,
+              f"Expected 8 downloaded runs; got {len(folders)}"
+          )
+
+          runs = {}
+          configs = {}
+          dynamic_ids = set()
+          inventory_reference = None
+          manifest = []
+          failure_details = []
+
+          for folder in folders:
+              artifact_name = folder.name
+
+              match = re.fullmatch(
+                  r"skyvern-step20-shard([0-3])-"
+                  r"slot([01])-(\d+)-(\d+)",
+                  artifact_name
+              )
+
+              check(
+                  match is not None,
+                  f"Unexpected artifact: {artifact_name}"
+              )
+
+              shard = int(match.group(1))
+              slot = int(match.group(2))
+
+              check(
+                  match.group(3) == source_id,
+                  "Source run ID mismatch"
+              )
+              check(
+                  artifact_name in artifact_info,
+                  "Artifact absent from GitHub metadata"
+              )
+
+              needed = [
+                  "suite-summary.json",
+                  "run-config.json",
+                  "outcomes-long.csv",
+                  "collected-nodeids.jsonl",
+                  "phase-reports.jsonl",
+                  "full-suite-pytest.log",
+              ]
+
+              for filename in needed:
+                  check(
+                      (folder / filename).is_file(),
+                      f"Missing {filename} in {artifact_name}"
+                  )
+
+              summary = load(
+                  folder / "suite-summary.json"
+              )
+              config = load(
+                  folder / "run-config.json"
+              )
+
+              number = int(summary["run_number"])
+
+              check(
+                  number == first + 2 * shard + slot,
+                  f"Unexpected repetition number {number}"
+              )
+              check(
+                  number not in runs,
+                  f"Duplicate repetition {number}"
+              )
+              check(
+                  summary.get("complete_suite_run") is True,
+                  f"Run {number} incomplete"
+              )
+              check(
+                  summary.get("inventory_verified") is True,
+                  f"Run {number} inventory not verified"
+              )
+              check(
+                  config.get("source_commit") == sha,
+                  f"Source commit mismatch in run {number}"
+              )
+
+              fingerprint = config.get("config_sha256")
+              check(
+                  fingerprint
+                  and fingerprint ==
+                  summary.get("config_sha256"),
+                  f"Config fingerprint mismatch in run {number}"
+              )
+
+              collected = []
+
+              with (
+                  folder / "collected-nodeids.jsonl"
+              ).open(encoding="utf-8") as f:
+                  for line in f:
+                      if line.strip():
+                          collected.append(json.loads(line))
+
+              check(
+                  len(collected) == 35776
+                  and len(set(collected)) == 35776,
+                  f"Collection mismatch in run {number}"
+              )
+
+              # Bit flags:
+              # 1 failed, 2 skipped,
+              # 4 setup passed, 8 call passed,
+              # 16 teardown passed.
+              flags = defaultdict(int)
+
+              with (
+                  folder / "phase-reports.jsonl"
+              ).open(encoding="utf-8") as f:
+                  for line in f:
+                      if not line.strip():
+                          continue
+
+                      p = json.loads(line)
+                      nid = p["nodeid"]
+                      phase = p["phase"]
+                      result = p["outcome"]
+
+                      if result == "failed":
+                          flags[nid] |= 1
+                          failure_details.append({
+                              "run_number": number,
+                              "test_id": normalize(nid),
+                              "phase": phase,
+                              "error": p.get("error", ""),
+                          })
+                      elif result == "skipped":
+                          flags[nid] |= 2
+                      elif result == "passed":
+                          flags[nid] |= {
+                              "setup": 4,
+                              "call": 8,
+                              "teardown": 16,
+                          }.get(phase, 0)
+
+              check(
+                  set(flags).issubset(set(collected)),
+                  f"Unexpected phase test in run {number}"
+              )
+
+              data = {}
+              stable_ids = set()
+              dynamic_count = 0
+              counts = Counter()
+
+              with (
+                  folder / "outcomes-long.csv"
+              ).open(
+                  encoding="utf-8", newline=""
+              ) as f:
+                  for row in csv.DictReader(f):
+                      raw = row["actual_pytest_nodeid"]
+                      tid = normalize(raw)
+
+                      check(
+                          raw in collected,
+                          f"Uncollected test in run {number}"
+                      )
+                      check(
+                          tid not in data,
+                          f"Duplicate test in run {number}"
+                      )
+                      check(
+                          row["sha"] == sha
+                          and int(row["run_number"]) == number,
+                          f"Row metadata mismatch: run {number}"
+                      )
+
+                      recorded = row["outcome"]
+                      calculated = outcome(flags.get(raw, 0))
+
+                      check(
+                          recorded == calculated,
+                          f"Original CSV/pytest mismatch: "
+                          f"run {number}, {tid}"
+                      )
+
+                      check(
+                          recorded in ("1", "0", "S", "N"),
+                          "Invalid outcome"
+                      )
+
+                      is_dynamic = (
+                          row.get(
+                              "dynamic_parameter", ""
+                          ).lower() == "true"
+                          or "generated-param-slot-" in
+                          row.get("test_id", "")
+                      )
+
+                      if is_dynamic:
+                          dynamic_count += 1
+                          dynamic_ids.add(tid)
+                      else:
+                          check(
+                              row["test_id"] == tid,
+                              "Stable test ID mismatch"
+                          )
+                          stable_ids.add(tid)
+
+                      data[tid] = recorded
+                      counts[recorded] += 1
+
+              check(
+                  len(data) == 35776
+                  and dynamic_count == 3,
+                  f"Inventory size mismatch: run {number}"
+              )
+              check(
+                  set(data) ==
+                  {normalize(n) for n in collected},
+                  f"Collected IDs differ: run {number}"
+              )
+
+              if inventory_reference is None:
+                  inventory_reference = stable_ids
+              else:
+                  check(
+                      stable_ids == inventory_reference,
+                      f"Stable inventory changed: run {number}"
+                  )
+
+              for value, field in [
+                  ("1", "passed"),
+                  ("0", "failed"),
+                  ("S", "skipped"),
+                  ("N", "missing"),
+              ]:
+                  check(
+                      counts[value] == int(summary[field]),
+                      f"{field} count mismatch: run {number}"
+                  )
+
+              check(
+                  counts["N"] == 0,
+                  f"Missing outcomes in run {number}"
+              )
+
+              runs[number] = data
+              configs[number] = fingerprint
+
+              manifest.append({
+                  "run_number": number,
+                  "source_workflow_run_id": source_id,
+                  "artifact_name": artifact_name,
+                  "artifact_sha256": artifact_info[
+                      artifact_name
+                  ].get("digest", ""),
+                  "source_commit": sha,
+                  "config_sha256": fingerprint,
+                  "runner_image_version": config.get(
+                      "runner_image_version", ""
+                  ),
+                  "wall_seconds": summary.get(
+                      "wall_seconds", ""
+                  ),
+                  "passed": counts["1"],
+                  "failed": counts["0"],
+                  "skipped": counts["S"],
+                  "missing": counts["N"],
+                  "complete": True,
+              })
+
+              print(
+                  f"Verified run {number}: "
+                  f"P={counts['1']} F={counts['0']} "
+                  f"S={counts['S']} N={counts['N']}",
+                  flush=True
+              )
+
+          check(
+              set(runs) == expected,
+              "Eight consecutive repetitions not found"
+          )
+
+          numbers = sorted(runs)
+          ids = sorted(set().union(
+              *(set(runs[n]) for n in numbers)
+          ))
+
+          def base(tid):
+              module, _, test_name = tid.partition("::")
+              return {
+                  "test_id": tid,
+                  "test_name": test_name or tid,
+                  "module": module,
+                  "sha": sha,
+              }
+
+          inventory = []
+          wide = []
+          stats = []
+          failures = []
+          flaky = []
+
+          for tid in ids:
+              b = base(tid)
+              inventory.append(b)
+
+              values = {
+                  n: runs[n].get(tid, "N")
+                  for n in numbers
+              }
+
+              wide.append({
+                  **b,
+                  **{
+                      f"run_{n}": values[n]
+                      for n in numbers
+                  },
+              })
+
+              count = Counter(values.values())
+              failed_runs = [
+                  n for n in numbers
+                  if values[n] == "0"
+              ]
+
+              executed = count["1"] + count["0"]
+
+              stats.append({
+                  "test_id": tid,
+                  "pass_count": count["1"],
+                  "fail_count": count["0"],
+                  "skip_count": count["S"],
+                  "missing_count": count["N"],
+                  "failure_rate": (
+                      round(count["0"] / executed, 8)
+                      if executed else ""
+                  ),
+                  "dynamic_parameter": tid in dynamic_ids,
+              })
+
+              failures.append({
+                  "test_name": tid,
+                  "fail_runs_count": len(failed_runs),
+                  "first_failing_run": (
+                      failed_runs[0] if failed_runs else ""
+                  ),
+                  "all_failing_runs": ";".join(
+                      str(n) for n in failed_runs
+                  ),
+              })
+
+              if tid not in dynamic_ids:
+                  grouped = defaultdict(Counter)
+
+                  for n in numbers:
+                      grouped[
+                          configs[n]
+                      ][values[n]] += 1
+
+                  for fingerprint, c in grouped.items():
+                      if c["1"] and c["0"]:
+                          flaky.append({
+                              "test_id": tid,
+                              "config_sha256": fingerprint,
+                              "passes": c["1"],
+                              "fails": c["0"],
+                          })
+
+          end = numbers[-1]
+
+          save_csv(
+              "test_inventory.csv",
+              ["test_id", "test_name", "module", "sha"],
+              inventory
+          )
+
+          save_csv(
+              f"full_suite_outcomes_{first}_to_{end}.csv",
+              [
+                  "test_id", "test_name", "module", "sha",
+                  *[f"run_{n}" for n in numbers],
+              ],
+              wide
+          )
+
+          save_csv(
+              "per_test_statistics.csv",
+              [
+                  "test_id", "pass_count", "fail_count",
+                  "skip_count", "missing_count",
+                  "failure_rate", "dynamic_parameter",
+              ],
+              stats
+          )
+
+          save_csv(
+              "full_suite_failure_summary.csv",
+              [
+                  "test_name", "fail_runs_count",
+                  "first_failing_run", "all_failing_runs",
+              ],
+              failures
+          )
+
+          save_csv(
+              "flaky_observations.csv",
+              [
+                  "test_id", "config_sha256",
+                  "passes", "fails",
+              ],
+              flaky
+          )
+
+          save_csv(
+              "run_manifest.csv",
+              list(manifest[0]),
+              sorted(manifest, key=lambda x: x["run_number"])
+          )
+
+          with (
+              out / "failure_phase_excerpts.jsonl"
+          ).open("w", encoding="utf-8") as f:
+              for record in failure_details:
+                  f.write(
+                      json.dumps(record, ensure_ascii=False)
+                      + "\n"
+                  )
+
+          artifact_rows = [
+              {
+                  "artifact_name": a["name"],
+                  "digest_sha256": a.get("digest", ""),
+                  "size_bytes": a.get("size_in_bytes", ""),
+                  "expires_at": a.get("expires_at", ""),
+              }
+              for a in artifacts
+          ]
+
+          save_csv(
+              "original_artifact_manifest.csv",
+              [
+                  "artifact_name", "digest_sha256",
+                  "size_bytes", "expires_at",
+              ],
+              artifact_rows
+          )
+
+          total = Counter()
+          for data in runs.values():
+              total.update(data.values())
+
+          report = {
+              "source_workflow_run_id": source_id,
+              "source_url": source.get("html_url"),
+              "run_numbers": numbers,
+              "complete_runs": len(runs),
+              "tests_per_run": 35776,
+              "total_outcomes": sum(total.values()),
+              "passes": total["1"],
+              "fails": total["0"],
+              "skips": total["S"],
+              "missing": total["N"],
+              "phase_csv_mismatches": 0,
+              "observed_flaky_candidates_within_batch":
+                  len({r["test_id"] for r in flaky}),
+              "original_logs_included": False,
+              "source_commit": sha,
+          }
+
+          (out / "validation_summary.json").write_text(
+              json.dumps(report, indent=2),
+              encoding="utf-8"
+          )
+
+          readme = f"""# Skyvern Lightweight Results Export
+
+          Original workflow:
+          {source.get("html_url")}
+
+          Full-suite repetitions: {first}-{end}
+          Completed repetitions: 8
+          Skyvern source commit: {sha}
+
+          These results were extracted from original
+          GitHub Actions execution artifacts.
+
+          Every recorded outcome was checked against
+          its original pytest phase reports.
+
+          This export does NOT re-execute tests.
+
+          IMPORTANT:
+          - This is one interim batch, not 5000 runs.
+          - Original complete logs are NOT copied here.
+          - The original GitHub artifacts contain
+            full pytest logs, phase reports, and configs.
+          - Preserve those original artifacts before
+            their retention period expires.
+          - Three test parameter values are dynamically
+            generated per run. Exact pytest IDs are used;
+            different generated inputs are not conflated.
+          - N for an absent dynamic input in the combined
+            CSV does not mean an execution was lost.
+          - Flaky observations here compare only these
+            eight runs and matching recorded configs.
+          - No isolation results are included.
+          - No AutoGPT results are included.
+          """
+
+          (out / "README.md").write_text(
+              "\n".join(
+                  x.lstrip() for x in readme.splitlines()
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          print(
+              json.dumps(report, indent=2),
+              flush=True
+          )
+          PY
+
+      - name: Upload compact result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Skyvern_FullSuite_Lightweight_Results_${{ inputs.source_run_id }}
+          path: report/
+          retention-days: 90
+          compression-level: 9
+          if-no-files-found: error
