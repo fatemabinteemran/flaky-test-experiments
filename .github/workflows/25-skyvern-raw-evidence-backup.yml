@@ -1,0 +1,357 @@
+
+name: Skyvern Raw Research Evidence Backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_public_release:
+        description: "I confirm these research logs may be stored in a public GitHub Release"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: skyvern-research-raw-backup
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  RELEASE_TAG: skyvern-python-fullsuite-raw-evidence-001-146
+
+jobs:
+  create-backup:
+    if: ${{ inputs.confirm_public_release }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create archival release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "$RELEASE_TAG" \
+               --repo "$GH_REPO" > /dev/null 2>&1; then
+
+            gh release create "$RELEASE_TAG" \
+              --repo "$GH_REPO" \
+              --target main \
+              --title "Skyvern Python Full-Suite - Raw Research Evidence (Runs 001-146)" \
+              --notes "Original GitHub Actions execution evidence. Pinned Skyvern SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb. Interim research archive; not the completed 5000-repetition study." \
+              --prerelease
+          fi
+
+  backup:
+    needs: create-backup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - {source: 44756785073, first: 1, last: 66}
+          - {source: 44868623614, first: 67, last: 74}
+          - {source: 44909753161, first: 75, last: 82}
+          - {source: 44916281592, first: 83, last: 90}
+          - {source: 44926610096, first: 91, last: 98}
+          - {source: 44991191598, first: 99, last: 106}
+          - {source: 45001961239, first: 107, last: 114}
+          - {source: 45006883875, first: 115, last: 122}
+          - {source: 45017631759, first: 123, last: 130}
+          - {source: 45033389006, first: 131, last: 138}
+          - {source: 45041017242, first: 139, last: 146}
+
+    env:
+      SOURCE_RUN: ${{ matrix.source }}
+      FIRST: ${{ matrix.first }}
+      LAST: ${{ matrix.last }}
+      EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
+
+    steps:
+      - name: Download existing evidence from GitHub Actions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p original
+
+          gh api \
+            "repos/$GH_REPO/actions/runs/$SOURCE_RUN" \
+            > source-run.json
+
+          gh api \
+            "repos/$GH_REPO/actions/runs/$SOURCE_RUN/artifacts?per_page=100" \
+            > original-artifact-metadata.json
+
+          gh run download "$SOURCE_RUN" \
+            --repo "$GH_REPO" \
+            --dir original
+
+      - name: Validate and archive original files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from collections import Counter
+          from pathlib import Path
+
+          root = Path("original")
+          source = os.environ["SOURCE_RUN"]
+          first = int(os.environ["FIRST"])
+          last = int(os.environ["LAST"])
+          sha = os.environ["EXPECTED_SHA"]
+
+          def require(value, message):
+              if not value:
+                  raise RuntimeError(message)
+
+          metadata = json.loads(
+              Path("original-artifact-metadata.json").read_text()
+          )
+
+          run_metadata = json.loads(
+              Path("source-run.json").read_text()
+          )
+
+          require(
+              run_metadata.get("conclusion") == "success",
+              "Original GitHub workflow not successful"
+          )
+
+          artifacts = metadata.get("artifacts", [])
+
+          expected_artifacts = 1 if first == 1 else 8
+
+          require(
+              len(artifacts) == expected_artifacts,
+              "Original artifact count mismatch"
+          )
+
+          require(
+              not any(a.get("expired") for a in artifacts),
+              "An original artifact has expired"
+          )
+
+          summaries = sorted(
+              root.rglob("suite-summary.json")
+          )
+
+          require(
+              len(summaries) == last - first + 1,
+              "Missing original suite summaries"
+          )
+
+          observed = set()
+          validated = []
+          files = []
+
+          for summary_path in summaries:
+              folder = summary_path.parent
+
+              summary = json.loads(
+                  summary_path.read_text()
+              )
+
+              number = int(
+                  summary.get("run_number")
+                  or summary.get("suite_run_number")
+                  or 0
+              )
+
+              require(
+                  first <= number <= last
+                  and number not in observed,
+                  "Unexpected or duplicate suite repetition"
+              )
+
+              observed.add(number)
+
+              require(
+                  summary.get("complete_suite_run") is True,
+                  f"Run {number} is incomplete"
+              )
+
+              for name in (
+                  "run-config.json",
+                  "collected-nodeids.jsonl",
+                  "phase-reports.jsonl",
+                  "full-suite-pytest.log",
+                  "outcomes-long.csv",
+              ):
+                  require(
+                      (folder / name).is_file(),
+                      f"Run {number} missing {name}"
+                  )
+
+              config = json.loads(
+                  (folder / "run-config.json").read_text()
+              )
+
+              require(
+                  config.get("source_commit") == sha,
+                  f"Source commit mismatch: {number}"
+              )
+
+              with (
+                  folder / "outcomes-long.csv"
+              ).open(newline="", encoding="utf-8") as f:
+                  counts = Counter(
+                      row["outcome"]
+                      for row in csv.DictReader(f)
+                  )
+
+              require(
+                  sum(counts.values()) == 35776,
+                  f"Wrong outcome count: run {number}"
+              )
+
+              require(
+                  counts["N"] == 0,
+                  f"Missing test outcomes: run {number}"
+              )
+
+              reported = summary.get("outcomes")
+
+              if reported is None:
+                  reported = {
+                      "1": summary.get("passed"),
+                      "0": summary.get("failed"),
+                      "S": summary.get("skipped"),
+                      "N": summary.get("missing"),
+                  }
+
+              for outcome in ("1", "0", "S", "N"):
+                  require(
+                      counts[outcome] == int(reported[outcome]),
+                      f"Outcome count mismatch: run {number}"
+                  )
+
+              validated.append({
+                  "run_number": number,
+                  "passed": counts["1"],
+                  "failed": counts["0"],
+                  "skipped": counts["S"],
+                  "missing": counts["N"],
+                  "config_sha256": config.get(
+                      "config_sha256", ""
+                  ),
+              })
+
+          require(
+              observed == set(range(first, last + 1)),
+              "Run numbers are not consecutive"
+          )
+
+          for file in sorted(root.rglob("*")):
+              if file.is_file():
+                  digest = hashlib.file_digest(
+                      file.open("rb"), "sha256"
+                  ).hexdigest()
+
+                  files.append({
+                      "file": str(file.relative_to(root)),
+                      "sha256": digest,
+                      "bytes": file.stat().st_size,
+                  })
+
+          manifest = {
+              "project": "Skyvern",
+              "setting": "Python full suite",
+              "source_commit": sha,
+              "source_workflow_run_id": source,
+              "source_workflow_url": (
+                  "https://github.com/"
+                  + os.environ["GH_REPO"]
+                  + "/actions/runs/"
+                  + source
+              ),
+              "first_run_number": first,
+              "last_run_number": last,
+              "validated_runs": sorted(
+                  validated,
+                  key=lambda x: x["run_number"]
+              ),
+              "original_artifact_metadata": artifacts,
+              "original_files": files,
+          }
+
+          filename = (
+              f"Skyvern_Python_FullSuite_Raw_"
+              f"Runs_{first:03d}-{last:03d}_"
+              f"Source_{source}.zip"
+          )
+
+          with zipfile.ZipFile(
+              filename, "w",
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=6,
+              allowZip64=True
+          ) as archive:
+
+              for file in sorted(root.rglob("*")):
+                  if file.is_file():
+                      archive.write(
+                          file,
+                          "Original_Artifacts/"
+                          + str(file.relative_to(root))
+                      )
+
+              archive.writestr(
+                  "evidence_manifest.json",
+                  json.dumps(manifest, indent=2)
+              )
+
+          with zipfile.ZipFile(filename) as archive:
+              require(
+                  archive.testzip() is None,
+                  "Backup ZIP integrity failed"
+              )
+
+          digest = hashlib.file_digest(
+              open(filename, "rb"), "sha256"
+          ).hexdigest()
+
+          Path(filename + ".sha256").write_text(
+              f"{digest}  {filename}\n"
+          )
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"ARCHIVE_FILE={filename}\n")
+
+          print(
+              f"VALIDATED {len(validated)} RUNS: "
+              f"{first}-{last}"
+          )
+          print("BACKUP:", filename)
+          print("SHA256:", digest)
+          PY
+
+      - name: Upload archive to GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "$RELEASE_TAG" \
+            "$ARCHIVE_FILE" \
+            "$ARCHIVE_FILE.sha256" \
+            --repo "$GH_REPO" \
+            --clobber
+
+          gh release view "$RELEASE_TAG" \
+            --repo "$GH_REPO" \
+            --json assets \
+            --jq '.assets[].name' \
+            | grep -Fx "$ARCHIVE_FILE"
+
+          echo "Original evidence backup uploaded successfully."
