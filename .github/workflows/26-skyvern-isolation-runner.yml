@@ -5,19 +5,19 @@ on:
   workflow_dispatch:
     inputs:
       first_test_index:
-        description: "Starting index in verified stable test inventory"
+        description: "Starting index in verified stable inventory"
         required: true
         type: number
-        default: 325
+        default: 437
 
       tests_per_shard:
-        description: "Number of individual tests assigned to each shard"
+        description: "Number of tests assigned to each shard"
         required: true
         type: number
-        default: 16
+        default: 12
 
       first_repetition:
-        description: "Starting repetition number for this protocol"
+        description: "Starting repetition number"
         required: true
         type: number
         default: 1
@@ -46,14 +46,18 @@ jobs:
     env:
       EXPECTED_SHA: dca0f98fe76cbb4bb0e7824c53dffe8a26ac68fb
       EXPECTED_INVENTORY_SHA: ceaf5226500a321838b802cac833522347f54e483911b7f490cf62243ca211fa
+
       FIRST_INDEX: ${{ inputs.first_test_index }}
       TESTS_PER_SHARD: ${{ inputs.tests_per_shard }}
       FIRST_REPETITION: ${{ inputs.first_repetition }}
       REPETITIONS: ${{ inputs.repetitions }}
       SHARD: ${{ matrix.shard }}
+
       TEST_TIMEOUT: 120
       JOB_EXECUTION_BUDGET: 2400
+
       PYTHONPATH: ${{ github.workspace }}/research_tools
+
       CI: 'true'
       PYTHONUNBUFFERED: '1'
       PYTHONFAULTHANDLER: '1'
@@ -170,7 +174,7 @@ jobs:
               )
           PY
 
-      - name: Execute isolated tests
+      - name: Execute corrected isolated tests
         shell: bash
         run: |
           set -euo pipefail
@@ -187,6 +191,7 @@ jobs:
           import statistics
           import subprocess
           import sys
+          import tempfile
           import time
 
           from collections import Counter
@@ -224,6 +229,7 @@ jobs:
           def normalize(nodeid):
               if nodeid.startswith("unit/"):
                   return "tests/" + nodeid
+
               return nodeid
 
           def read_jsonl(path):
@@ -254,7 +260,7 @@ jobs:
               )
 
           # ==========================================
-          # Collect and verify the original inventory
+          # Collect and verify original test inventory
           # ==========================================
 
           collection = out / "collection"
@@ -384,6 +390,8 @@ jobs:
 
           selected = stable[start_index:end_index]
 
+          assert len(selected) == size
+
           save_json(
               out / "assigned-tests.json",
               {
@@ -394,7 +402,7 @@ jobs:
           )
 
           # ==========================================
-          # Record the execution configuration
+          # Record execution configuration
           # ==========================================
 
           dependencies = sorted(
@@ -421,11 +429,24 @@ jobs:
               ).read_bytes()
           ).hexdigest()
 
+          runner_hash = hashlib.sha256(
+              Path(__file__).read_bytes()
+          ).hexdigest()
+
+          real_home = Path.home().resolve()
+          scratch_root = Path("/tmp").resolve()
+
+          assert not scratch_root.is_relative_to(
+              real_home
+          ), "Scratch directory is inside real home"
+
           config = {
               "project": "Skyvern",
               "source_commit": sha,
               "setting": "isolation",
-              "protocol": "step26_fresh_process",
+              "protocol": (
+                  "step26_v2_fresh_process_external_tmp"
+              ),
               "python_version": platform.python_version(),
               "platform": platform.platform(),
               "machine": platform.machine(),
@@ -440,19 +461,22 @@ jobs:
               ).hexdigest(),
               "dependencies_sha256": dependency_hash,
               "recorder_sha256": recorder_hash,
+              "runner_sha256": runner_hash,
               "stable_inventory_sha256": inventory_sha,
               "test_timeout_seconds": timeout,
               "process_isolation": "fresh Python process",
               "filesystem_isolation": (
-                  "unique pytest basetemp and cache directory; "
+                  "Unique pytest temporary and cache "
+                  "directories under /tmp outside real home; "
                   "shared source checkout"
               ),
+              "temporary_directory_root": "/tmp",
               "command_template": [
                   ".venv/bin/python", "-m", "pytest",
                   "-p", "isolation_recorder",
                   "-q", "--tb=long", "-ra",
-                  "--basetemp=<unique>",
-                  "-o", "cache_dir=<unique>",
+                  "--basetemp=<unique_external_tmp>",
+                  "-o", "cache_dir=<unique_external_tmp>",
                   "--", "<single test_id>"
               ]
           }
@@ -475,6 +499,7 @@ jobs:
           )
 
           config["shard"] = shard
+          config["real_home"] = str(real_home)
 
           save_json(
               out / "run-config.json",
@@ -489,6 +514,7 @@ jobs:
           logs.mkdir(exist_ok=True)
 
           def execute(tid, index, repetition):
+
               case = (
                   logs /
                   f"test_{index:05d}_run_{repetition:04d}"
@@ -496,8 +522,23 @@ jobs:
 
               case.mkdir(exist_ok=False)
 
-              temporary = case / "temporary"
-              cache = case / "pytest_cache"
+              # CORRECTED CONFIGURATION:
+              # Keep temporary pytest files outside
+              # /home/runner and GitHub workspace.
+
+              scratch = Path(
+                  tempfile.mkdtemp(
+                      prefix="skyvern-isolation-",
+                      dir="/tmp"
+                  )
+              ).resolve()
+
+              assert not scratch.is_relative_to(
+                  real_home
+              ), "Temporary directory inside real home"
+
+              temporary = scratch / "temporary"
+              cache = scratch / "pytest_cache"
 
               env = dict(
                   os.environ,
@@ -518,143 +559,160 @@ jobs:
 
               timed_out = False
 
-              with (
-                  case / "pytest.log"
-              ).open("w", encoding="utf-8") as log:
+              try:
+                  with (
+                      case / "pytest.log"
+                  ).open("w", encoding="utf-8") as log:
 
-                  proc = subprocess.Popen(
-                      cmd,
-                      cwd=source,
-                      env=env,
-                      stdout=log,
-                      stderr=subprocess.STDOUT,
-                      start_new_session=True
-                  )
-
-                  try:
-                      exit_code = proc.wait(
-                          timeout=timeout
+                      proc = subprocess.Popen(
+                          cmd,
+                          cwd=source,
+                          env=env,
+                          stdout=log,
+                          stderr=subprocess.STDOUT,
+                          start_new_session=True
                       )
 
-                  except subprocess.TimeoutExpired:
-                      timed_out = True
-
                       try:
-                          os.killpg(
-                              proc.pid, signal.SIGKILL
+                          exit_code = proc.wait(
+                              timeout=timeout
                           )
-                      except ProcessLookupError:
-                          pass
 
-                      exit_code = proc.wait()
+                      except subprocess.TimeoutExpired:
+                          timed_out = True
 
-              elapsed = round(
-                  time.monotonic() - started, 4
-              )
+                          try:
+                              os.killpg(
+                                  proc.pid,
+                                  signal.SIGKILL
+                              )
+                          except ProcessLookupError:
+                              pass
 
-              collected = [
-                  normalize(x)
-                  for x in read_jsonl(
-                      case / "collected-nodeids.jsonl"
+                          exit_code = proc.wait()
+
+                  elapsed = round(
+                      time.monotonic() - started, 4
                   )
-              ]
 
-              reports = read_jsonl(
-                  case / "phase-reports.jsonl"
-              )
+                  collected = [
+                      normalize(x)
+                      for x in read_jsonl(
+                          case / "collected-nodeids.jsonl"
+                      )
+                  ]
 
-              exact_selection = (
-                  collected == [tid]
-                  and all(
-                      normalize(r["nodeid"]) == tid
+                  reports = read_jsonl(
+                      case / "phase-reports.jsonl"
+                  )
+
+                  exact_selection = (
+                      collected == [tid]
+                      and all(
+                          normalize(r["nodeid"]) == tid
+                          for r in reports
+                      )
+                  )
+
+                  outcome = "N"
+                  reason = ""
+
+                  if not exact_selection:
+                      reason = (
+                          "incorrect_or_missing_selection"
+                      )
+
+                  elif any(
+                      r["outcome"] == "failed"
+                      for r in reports
+                  ):
+                      outcome = "0"
+                      reason = "reported_test_failure"
+
+                  elif timed_out:
+                      reason = "timeout"
+
+                  elif exit_code != 0:
+                      reason = "abnormal_pytest_exit"
+
+                  elif any(
+                      r["outcome"] == "skipped"
+                      for r in reports
+                  ):
+                      outcome = "S"
+                      reason = "reported_skip"
+
+                  elif all(
+                      any(
+                          r["phase"] == phase
+                          and r["outcome"] == "passed"
+                          for r in reports
+                      )
+                      for phase in (
+                          "setup", "call", "teardown"
+                      )
+                  ):
+                      outcome = "1"
+                      reason = "all_phases_passed"
+
+                  else:
+                      reason = "no_complete_result"
+
+                  phase_seconds = sum(
+                      float(r.get("duration_seconds", 0))
                       for r in reports
                   )
-              )
 
-              outcome = "N"
-              reason = ""
-
-              if not exact_selection:
-                  reason = "incorrect_or_missing_selection"
-
-              elif any(
-                  r["outcome"] == "failed"
-                  for r in reports
-              ):
-                  outcome = "0"
-                  reason = "reported_test_failure"
-
-              elif timed_out:
-                  reason = "timeout"
-
-              elif exit_code not in (0, 1):
-                  reason = "abnormal_pytest_exit"
-
-              elif any(
-                  r["outcome"] == "skipped"
-                  for r in reports
-              ):
-                  outcome = "S"
-                  reason = "reported_skip"
-
-              elif all(
-                  any(
-                      r["phase"] == phase
-                      and r["outcome"] == "passed"
-                      for r in reports
-                  )
-                  for phase in (
-                      "setup", "call", "teardown"
-                  )
-              ):
-                  outcome = "1"
-                  reason = "all_phases_passed"
-
-              else:
-                  reason = "no_complete_result"
-
-              row = {
-                  **metadata(tid),
-                  "test_index": index,
-                  "run_number": repetition,
-                  "setting": "isolation",
-                  "outcome": outcome,
-                  "reason": reason,
-                  "duration_seconds": elapsed,
-                  "pytest_exit_code": exit_code,
-                  "timed_out": timed_out,
-                  "wasxfail": any(
-                      r.get("wasxfail", False)
-                      for r in reports
-                  ),
-                  "attempted": True,
-                  "config_sha256": fingerprint,
-                  "log_directory": str(
-                      case.relative_to(out)
-                  ),
-                  "started_utc": start_utc,
-                  "ended_utc": utc_now()
-              }
-
-              save_json(
-                  case / "execution-result.json",
-                  {
-                      **row,
-                      "command": cmd,
-                      "exact_selection": exact_selection
+                  row = {
+                      **metadata(tid),
+                      "test_index": index,
+                      "run_number": repetition,
+                      "setting": "isolation",
+                      "outcome": outcome,
+                      "reason": reason,
+                      "duration_seconds": elapsed,
+                      "pytest_phase_seconds": round(
+                          phase_seconds, 6
+                      ),
+                      "overhead_seconds": round(
+                          max(0, elapsed - phase_seconds), 6
+                      ),
+                      "pytest_exit_code": exit_code,
+                      "timed_out": timed_out,
+                      "wasxfail": any(
+                          r.get("wasxfail", False)
+                          for r in reports
+                      ),
+                      "attempted": True,
+                      "config_sha256": fingerprint,
+                      "log_directory": str(
+                          case.relative_to(out)
+                      ),
+                      "started_utc": start_utc,
+                      "ended_utc": utc_now()
                   }
-              )
 
-              # Keep recorded logs, but remove temporary
-              # test files to reduce artifact size.
-              shutil.rmtree(
-                  temporary, ignore_errors=True
-              )
-              shutil.rmtree(
-                  cache, ignore_errors=True
-              )
+                  save_json(
+                      case / "execution-result.json",
+                      {
+                          **row,
+                          "command": cmd,
+                          "exact_selection": exact_selection,
+                          "scratch_directory": str(scratch),
+                          "real_home": str(real_home),
+                          "scratch_outside_real_home": True
+                      }
+                  )
 
-              return row
+                  return row
+
+              finally:
+                  # Remove only this execution's unique
+                  # scratch directory. Original logs stay.
+
+                  shutil.rmtree(
+                      scratch, ignore_errors=True
+                  )
 
           # ==========================================
           # Checkpointed repeated execution
@@ -678,6 +736,7 @@ jobs:
           ) as journal:
 
               for repetition in repetition_numbers:
+
                   for offset, tid in enumerate(selected):
 
                       if (
@@ -717,7 +776,9 @@ jobs:
                           flush=True
                       )
 
-          # Explicitly preserve unattempted cells as N.
+          # ==========================================
+          # Record missing executions explicitly
+          # ==========================================
 
           all_rows = []
 
@@ -729,6 +790,8 @@ jobs:
               "outcome",
               "reason",
               "duration_seconds",
+              "pytest_phase_seconds",
+              "overhead_seconds",
               "pytest_exit_code",
               "timed_out",
               "wasxfail",
@@ -740,6 +803,7 @@ jobs:
           ]
 
           for offset, tid in enumerate(selected):
+
               for repetition in repetition_numbers:
 
                   row = results.get(
@@ -767,7 +831,7 @@ jobs:
           )
 
           # ==========================================
-          # Professor-format CSVs
+          # Professor-format outcome and summary CSVs
           # ==========================================
 
           wide = []
@@ -776,6 +840,7 @@ jobs:
           flaky = []
 
           for tid in selected:
+
               values = {
                   n: results.get(
                       (tid, n), {}
@@ -808,6 +873,7 @@ jobs:
               })
 
               count = Counter(values.values())
+
               executed = count["1"] + count["0"]
 
               per_test_stats.append({
@@ -875,14 +941,28 @@ jobs:
               r["outcome"] for r in all_rows
           )
 
+          phase_durations = [
+              r["pytest_phase_seconds"]
+              for r in results.values()
+          ]
+
+          overhead_durations = [
+              r["overhead_seconds"]
+              for r in results.values()
+          ]
+
           summary = {
               "shard": shard,
               "setting": "isolation",
+              "protocol": (
+                  "step26_v2_fresh_process_external_tmp"
+              ),
               "source_commit": sha,
               "inventory_verified": True,
               "first_test_index": start_index,
               "end_test_index_exclusive": end_index,
               "assigned_tests": len(selected),
+              "first_repetition": first_rep,
               "repetitions_per_test": reps,
               "planned_executions": len(all_rows),
               "attempted_executions": len(results),
@@ -899,6 +979,18 @@ jobs:
                   round(statistics.median(durations), 4)
                   if durations else None
               ),
+              "mean_pytest_phase_seconds": (
+                  round(
+                      statistics.mean(phase_durations), 4
+                  )
+                  if phase_durations else None
+              ),
+              "mean_overhead_seconds": (
+                  round(
+                      statistics.mean(overhead_durations), 4
+                  )
+                  if overhead_durations else None
+              ),
               "execution_wall_seconds": round(
                   time.monotonic() - execution_start, 4
               ),
@@ -914,7 +1006,10 @@ jobs:
               summary
           )
 
-          print(json.dumps(summary, indent=2))
+          print(
+              json.dumps(summary, indent=2),
+              flush=True
+          )
 
           if not summary["complete_batch"]:
               print(
@@ -937,10 +1032,16 @@ jobs:
           if-no-files-found: warn
 
   summarize:
-    name: Consolidate isolation benchmark results
+    name: Consolidate corrected isolation results
     needs: isolation
     if: ${{ always() }}
     runs-on: ubuntu-24.04
+
+    env:
+      FIRST_INDEX: ${{ inputs.first_test_index }}
+      TESTS_PER_SHARD: ${{ inputs.tests_per_shard }}
+      FIRST_REPETITION: ${{ inputs.first_repetition }}
+      REPETITIONS: ${{ inputs.repetitions }}
 
     steps:
       - name: Download all four shard artifacts
@@ -949,7 +1050,7 @@ jobs:
           pattern: skyvern-isolation-shard-*
           path: shards
 
-      - name: Create lightweight combined results
+      - name: Create and validate combined results
         shell: bash
         run: |
           set -euo pipefail
@@ -960,10 +1061,16 @@ jobs:
           import csv
           import json
           import os
+          from collections import Counter
           from pathlib import Path
 
           root = Path("shards")
           out = Path("combined")
+
+          first = int(os.environ["FIRST_INDEX"])
+          size = int(os.environ["TESTS_PER_SHARD"])
+          first_rep = int(os.environ["FIRST_REPETITION"])
+          reps = int(os.environ["REPETITIONS"])
 
           summaries = [
               json.loads(p.read_text())
@@ -980,8 +1087,13 @@ jobs:
               "flaky-observations.csv"
           ]
 
+          merged = {}
+
           for filename in files:
-              sources = sorted(root.rglob(filename))
+
+              sources = sorted(
+                  root.rglob(filename)
+              )
 
               if not sources:
                   continue
@@ -990,9 +1102,11 @@ jobs:
               rows = []
 
               for p in sources:
+
                   with p.open(
                       newline="", encoding="utf-8"
                   ) as f:
+
                       reader = csv.DictReader(f)
 
                       if fields is None:
@@ -1005,11 +1119,15 @@ jobs:
               with (out / filename).open(
                   "w", newline="", encoding="utf-8"
               ) as f:
+
                   writer = csv.DictWriter(
                       f, fieldnames=fields
                   )
+
                   writer.writeheader()
                   writer.writerows(rows)
+
+              merged[filename] = rows
 
           keys = [
               "assigned_tests",
@@ -1021,22 +1139,103 @@ jobs:
           ]
 
           totals = {
-              key: sum(s.get(key, 0) for s in summaries)
+              key: sum(
+                  s.get(key, 0)
+                  for s in summaries
+              )
               for key in keys
           }
 
+          long_rows = merged.get(
+              "isolation-outcomes-long.csv", []
+          )
+
+          actual_counts = Counter(
+              r["outcome"]
+              for r in long_rows
+          )
+
+          observed_pairs = [
+              (
+                  int(r["test_index"]),
+                  int(r["run_number"])
+              )
+              for r in long_rows
+          ]
+
+          expected_pairs = {
+              (i, n)
+              for i in range(
+                  first, first + 4 * size
+              )
+              for n in range(
+                  first_rep, first_rep + reps
+              )
+          }
+
+          coverage_ok = (
+              len(observed_pairs) == len(expected_pairs)
+              and set(observed_pairs) == expected_pairs
+          )
+
+          outcome_counts_ok = all(
+              actual_counts[value] == totals[field]
+              for value, field in (
+                  ("1", "passed"),
+                  ("0", "failed"),
+                  ("S", "skipped"),
+                  ("N", "missing")
+              )
+          )
+
           complete = (
               len(summaries) == 4
+              and {
+                  s["shard"] for s in summaries
+              } == {0, 1, 2, 3}
               and all(
                   s["complete_batch"]
                   for s in summaries
               )
+              and coverage_ok
+              and outcome_counts_ok
           )
 
+          attempted_rows = [
+              r for r in long_rows
+              if r.get("attempted") == "True"
+          ]
+
+          def mean_field(name):
+              values = [
+                  float(r[name])
+                  for r in attempted_rows
+                  if r.get(name)
+              ]
+
+              return (
+                  round(sum(values) / len(values), 4)
+                  if values else None
+              )
+
           report = {
+              "protocol": (
+                  "step26_v2_fresh_process_external_tmp"
+              ),
               "completed_shard_reports": len(summaries),
               "all_batches_complete": complete,
+              "coverage_verified": coverage_ok,
+              "outcome_counts_verified": outcome_counts_ok,
               **totals,
+              "mean_execution_seconds": mean_field(
+                  "duration_seconds"
+              ),
+              "mean_pytest_phase_seconds": mean_field(
+                  "pytest_phase_seconds"
+              ),
+              "mean_overhead_seconds": mean_field(
+                  "overhead_seconds"
+              ),
               "shards": summaries
           }
 
@@ -1044,23 +1243,53 @@ jobs:
               json.dumps(report, indent=2)
           )
 
-          print(json.dumps(report, indent=2))
+          print(
+              json.dumps(report, indent=2),
+              flush=True
+          )
 
           with open(
               os.environ["GITHUB_STEP_SUMMARY"], "a"
           ) as f:
-              f.write("# Skyvern Isolation Benchmark\n\n")
+
+              f.write(
+                  "# Skyvern Corrected Isolation Results\n\n"
+              )
 
               for key, value in totals.items():
                   f.write(f"- {key}: {value}\n")
 
               f.write(
+                  f"- Coverage verified: {coverage_ok}\n"
+              )
+
+              f.write(
+                  f"- Outcome counts verified: "
+                  f"{outcome_counts_ok}\n"
+              )
+
+              f.write(
                   f"- All batches complete: {complete}\n"
               )
 
+              f.write(
+                  f"- Mean execution seconds: "
+                  f"{report['mean_execution_seconds']}\n"
+              )
+
+              f.write(
+                  f"- Mean pytest phase seconds: "
+                  f"{report['mean_pytest_phase_seconds']}\n"
+              )
+
+              f.write(
+                  f"- Mean overhead seconds: "
+                  f"{report['mean_overhead_seconds']}\n"
+              )
+
           if not complete:
-              print(
-                  "::warning::One or more shards incomplete."
+              raise SystemExit(
+                  "Isolation validation incomplete"
               )
           PY
 
